@@ -133,17 +133,24 @@ def get_or_create_subfolder(drive_service, parent_id: str, folder_name: str) -> 
 
 def download_twilio_media(media_url: str) -> bytes:
     """
-    Downloads media from Twilio. Supports HTTP Basic Authentication
-    if secure media downloads are enabled in the Twilio console.
+    Downloads media from Twilio using HTTP Basic Authentication with Twilio credentials.
     """
-    twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
-    twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
     
+    # Strip whitespace in case of copy-paste/env loading trailing spaces
+    if account_sid:
+        account_sid = account_sid.strip()
+    if auth_token:
+        auth_token = auth_token.strip()
+        
+    # We must explicitly use HTTP Basic Authentication using Twilio credentials
     auth = None
-    if twilio_sid and twilio_auth_token:
-        # Strip credentials in case copy-paste added extra spaces
-        auth = HTTPBasicAuth(twilio_sid.strip(), twilio_auth_token.strip())
-        logger.info("Configured Basic Authentication for Twilio secure media download.")
+    if account_sid and auth_token:
+        auth = (account_sid, auth_token)
+        logger.info("Configured HTTP Basic Authentication using Twilio credentials.")
+    else:
+        logger.warning("Twilio credentials not fully set. Proceeding without auth (Secure Media must be disabled).")
         
     logger.info(f"Downloading image asset from Twilio CDN URL: {media_url}")
     response = requests.get(media_url, auth=auth, timeout=30)
@@ -235,9 +242,12 @@ async def webhook_whatsapp(
     # 1. Extract and sanitize the plate string (Caption)
     license_plate = "A_TRAITER_SANS_PLAQUE"
     if Body:
-        cleaned_body = Body.strip()
+        # Strip trailing and leading spaces, and convert to uppercase
+        cleaned_body = Body.strip().upper()
         if cleaned_body:
-            license_plate = cleaned_body.upper()
+            # Clean up duplicate whitespace, newlines, and tabs inside the caption
+            cleaned_body = " ".join(cleaned_body.split())
+            license_plate = cleaned_body
             
     logger.info(f"Extracted and sanitized folder target name: '{license_plate}'")
     

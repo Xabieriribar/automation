@@ -48,17 +48,47 @@ _drive_service = None
 def get_drive_service():
     """
     Initializes and caches the Google Drive client.
-    Supports credentials specified via a file path or a raw JSON string.
+    Supports:
+    1. OAuth 2.0 User Credentials (via refresh token, client ID, and client secret) - Recommended for personal @gmail.com accounts to bypass quota limitations.
+    2. Google Service Account credentials (raw JSON string or file path) - Recommended for Workspace accounts with Shared Drives.
     """
     global _drive_service
     if _drive_service is not None:
         return _drive_service
 
+    scopes = ["https://www.googleapis.com/auth/drive"]
+
+    # 1. Try OAuth 2.0 User Credentials (highly recommended for personal accounts with quota issues)
+    refresh_token = os.getenv("GOOGLE_REFRESH_TOKEN")
+    client_id = os.getenv("GOOGLE_CLIENT_ID")
+    client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+
+    if refresh_token and client_id and client_secret:
+        try:
+            from google.oauth2.credentials import Credentials
+            credentials = Credentials(
+                token=None,
+                refresh_token=refresh_token.strip(),
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=client_id.strip(),
+                client_secret=client_secret.strip(),
+                scopes=scopes
+            )
+            logger.info("Google OAuth 2.0 User Credentials authenticated successfully! Acting on behalf of personal account.")
+            _drive_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
+            return _drive_service
+        except Exception as e:
+            logger.error(f"Failed to authenticate with OAuth 2.0 User Credentials: {e}")
+            raise
+
+    # 2. Fallback to Google Service Account
     google_creds_raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not google_creds_raw:
-        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON environment variable is not configured.")
+        raise ValueError(
+            "Neither Google OAuth credentials (GOOGLE_REFRESH_TOKEN) nor "
+            "Service Account credentials (GOOGLE_SERVICE_ACCOUNT_JSON) are configured."
+        )
 
-    scopes = ["https://www.googleapis.com/auth/drive"]
     google_creds_raw = google_creds_raw.strip()
 
     try:
@@ -82,13 +112,14 @@ def get_drive_service():
         _drive_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
         return _drive_service
     except Exception as e:
-        logger.error(f"Failed to authenticate with Google: {e}")
+        logger.error(f"Failed to authenticate with Google Service Account: {e}")
         raise
 
 def get_or_create_subfolder(drive_service, parent_id: str, folder_name: str) -> str:
     """
     Searches for a subfolder matching the cleaned license plate in the parent directory.
     If it exists, returns its ID. Otherwise, programmatically creates it.
+    Includes support for Google Shared Drives.
     """
     # Escape single quotes in the folder name to prevent Google Drive query breakdown
     escaped_name = folder_name.replace("'", "\\'")
@@ -105,7 +136,9 @@ def get_or_create_subfolder(drive_service, parent_id: str, folder_name: str) -> 
         q=query,
         spaces="drive",
         fields="files(id, name)",
-        pageSize=1
+        pageSize=1,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True
     ).execute()
     
     files = results.get("files", [])
@@ -124,7 +157,8 @@ def get_or_create_subfolder(drive_service, parent_id: str, folder_name: str) -> 
     
     new_folder = drive_service.files().create(
         body=folder_metadata,
-        fields="id"
+        fields="id",
+        supportsAllDrives=True
     ).execute()
     
     new_folder_id = new_folder.get("id")
@@ -160,6 +194,7 @@ def download_twilio_media(media_url: str) -> bytes:
 def upload_file_to_folder(drive_service, folder_id: str, file_content: bytes, filename: str) -> str:
     """
     Streams file bytes directly to a specific Google Drive folder.
+    Includes support for Google Shared Drives.
     """
     media = MediaIoBaseUpload(
         BytesIO(file_content),
@@ -176,7 +211,8 @@ def upload_file_to_folder(drive_service, folder_id: str, file_content: bytes, fi
     uploaded_file = drive_service.files().create(
         body=file_metadata,
         media_body=media,
-        fields="id"
+        fields="id",
+        supportsAllDrives=True
     ).execute()
     
     file_id = uploaded_file.get("id")

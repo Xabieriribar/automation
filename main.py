@@ -230,62 +230,233 @@ def build_twiml_response(message: str) -> Response:
 </Response>"""
     return Response(content=xml_content, media_type="application/xml")
 
-@app.on_event("startup")
-def startup_event():
+# =====================================================================
+# --- Feature: Validation Client Instantanée (Approbation Budget 1-Clic) ---
+# =====================================================================
+import re
+
+try:
+    from twilio.rest import Client as TwilioClient
+    HAS_TWILIO_SDK = True
+except ImportError:
+    HAS_TWILIO_SDK = False
+    logger.warning("Twilio SDK is not installed. Falling back to direct REST API calls via requests.")
+
+# In-memory session store for pending client validations
+# Keys: client_number (e.g. "whatsapp:+41791234567")
+# Values: {"plate": "VD 123456", "garage_number": "whatsapp:+41797654321"}
+PENDING_VALIDATIONS = {}
+
+def format_to_e164(phone_number: str) -> str:
     """
-    Performs critical environment checks and pre-warms the Google Drive credentials.
-    Allows errors to log clearly at boot time rather than on the first request.
+    Cleans and formats a phone number to E.164.
+    If it starts with 0, we assume it's a Swiss number (+41) since timezone is Europe/Zurich.
     """
-    logger.info("Initializing Twilio-Google Drive Webhook Application...")
+    cleaned = re.sub(r'[^\d+]', '', phone_number)
+    if cleaned.startswith('+'):
+        return cleaned
+    if cleaned.startswith('0'):
+        return '+41' + cleaned[1:]
+    return cleaned
+
+def send_whatsapp_message(to_number: str, body_content: str, from_number: str, content_sid: Optional[str] = None, content_variables: Optional[str] = None) -> Optional[str]:
+    """
+    Sends a WhatsApp message using either the Twilio SDK (if available) or direct REST API requests.
+    """
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
     
-    parent_folder_id = os.getenv("GOOGLE_DRIVE_PARENT_FOLDER_ID")
-    if not parent_folder_id:
-        logger.error("WARNING: GOOGLE_DRIVE_PARENT_FOLDER_ID is missing from your configuration.")
+    if not account_sid or not auth_token:
+        logger.error("Twilio credentials missing in environment variables. Cannot send WhatsApp message.")
+        return None
+        
+    formatted_to = to_number if to_number.startswith("whatsapp:") else f"whatsapp:{to_number}"
+    formatted_from = from_number if from_number.startswith("whatsapp:") else f"whatsapp:{from_number}"
+    
+    # Try using Twilio SDK if available
+    if HAS_TWILIO_SDK:
+        try:
+            client = TwilioClient(account_sid, auth_token)
+            if content_sid:
+                message = client.messages.create(
+                    to=formatted_to,
+                    from_=formatted_from,
+                    content_sid=content_sid,
+                    content_variables=content_variables
+                )
+            else:
+                message = client.messages.create(
+                    to=formatted_to,
+                    from_=formatted_from,
+                    body=body_content
+                )
+            logger.info(f"WhatsApp message successfully sent via SDK. Message SID: {message.sid}")
+            return message.sid
+        except Exception as e:
+            logger.error(f"Failed to send WhatsApp message via SDK: {e}. Trying REST API fallback.")
+            
+    # Fallback to direct HTTP request using requests
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+    data = {
+        "To": formatted_to,
+        "From": formatted_from,
+    }
+    
+    if content_sid:
+        data["ContentSid"] = content_sid
+        if content_variables:
+            data["ContentVariables"] = content_variables
     else:
-        logger.info(f"Configured Parent Drive ID: '{parent_folder_id}'")
+        data["Body"] = body_content
         
     try:
-        get_drive_service()
-        logger.info("Google Drive service successfully initialized and authenticated!")
+        response = requests.post(url, data=data, auth=HTTPBasicAuth(account_sid, auth_token), timeout=15)
+        if response.status_code in [200, 201]:
+            res_json = response.json()
+            logger.info(f"WhatsApp message successfully sent via REST API. Message SID: {res_json.get('sid')}")
+            return res_json.get('sid')
+        else:
+            logger.error(f"Failed to send WhatsApp message via REST API. Status: {response.status_code}, Response: {response.text}")
+            return None
     except Exception as e:
-        logger.error(f"WARNING: Google Drive initialization failed at startup: {e}")
+        logger.error(f"Error during REST API fallback call: {e}")
+        return None
 
-@app.get("/health", tags=["Monitoring"])
-async def health_check():
+def send_validation_buttons(client_number: str, plate: str, from_number: str) -> bool:
     """
-    Basic health check endpoint for monitoring systems (UptimeRobot, Render, etc.)
+    Sends interactive buttons (Quick Replies) or fallback interactive instructions to the client.
     """
-    status_info = {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
-    try:
-        get_drive_service()
-        status_info["google_drive"] = "connected"
-    except Exception:
-        status_info["google_drive"] = "error"
-    return status_info
+    target_number = client_number
+    if not target_number:
+        target_number = os.getenv("DEBUG_CLIENT_NUMBER")
+        if not target_number:
+            logger.error("No client number provided and DEBUG_CLIENT_NUMBER is not set.")
+            return False
+            
+    target_number = format_to_e164(target_number)
+    content_sid = os.getenv("TWILIO_CONTENT_SID")
+    
+    body = f"Bonjour, le garage a détecté une anomalie sur votre véhicule {plate}. Veuillez valider ou refuser les réparations supplémentaires via les boutons ci-dessous :"
+    
+    if content_sid:
+        # Use Twilio Content API template
+        content_variables = json.dumps({"1": plate})
+        logger.info(f"Sending interactive WhatsApp buttons via Template {content_sid} to client {target_number}")
+        sid = send_whatsapp_message(
+            to_number=target_number,
+            body_content="",
+            from_number=from_number,
+            content_sid=content_sid,
+            content_variables=content_variables
+        )
+        return sid is not None
+    else:
+        # Fallback to interactive text message
+        fallback_body = (
+            f"{body}\n\n"
+            f"👉 Répondez directement par :\n"
+            f"1️⃣ *Autoriser les travaux*\n"
+            f"2️⃣ *Refuser*"
+        )
+        logger.info(f"Sending fallback WhatsApp interactive text to client {target_number}")
+        sid = send_whatsapp_message(
+            to_number=target_number,
+            body_content=fallback_body,
+            from_number=from_number
+        )
+        return sid is not None
 
 @app.post("/webhook/whatsapp", tags=["Webhooks"])
 async def webhook_whatsapp(
     Body: Optional[str] = Form(None),
     MediaUrl0: Optional[str] = Form(None),
     NumMedia: Optional[int] = Form(None),
-    From: Optional[str] = Form(None)
+    From: Optional[str] = Form(None),
+    To: Optional[str] = Form(None),
+    ButtonText: Optional[str] = Form(None),
+    ButtonPayload: Optional[str] = Form(None)
 ):
     """
-    Twilio Webhook endpoint. Handles incoming WhatsApp media messages.
+    Twilio Webhook endpoint. Handles incoming WhatsApp media messages and client interactive button responses.
     """
-    logger.info(f"Incoming request from {From or 'Unknown Sender'}. Attachments detected (NumMedia): {NumMedia or 0}")
+    logger.info(f"Incoming request from {From or 'Unknown Sender'} to {To or 'Unknown Recipient'}. Body: '{Body or ''}'")
     
+    # 0. Check if the message is a client interactive response to a budget request
+    client_response = None
+    if ButtonText:
+        client_response = ButtonText.strip()
+    elif Body:
+        # Check if the Body matches one of the button texts
+        body_cleaned = Body.strip().lower()
+        if "autoriser les travaux" in body_cleaned or body_cleaned == "refuser":
+            client_response = Body.strip()
+            
+    if client_response and From:
+        logger.info(f"Client interactive response detected: '{client_response}' from {From}")
+        # Look up in our in-memory session store
+        session = PENDING_VALIDATIONS.get(From)
+        if session:
+            plate = session.get("plate")
+            garage_number = session.get("garage_number")
+            
+            # Send WhatsApp confirmation to the garage manager
+            if "autoriser" in client_response.lower():
+                manager_message = f"✅ Le client a AUTORISÉ les travaux pour le véhicule {plate}."
+            else:
+                manager_message = f"❌ Le client a REFUSÉ les travaux pour le véhicule {plate}."
+                
+            # Send the message to the manager from the Twilio number
+            logger.info(f"Relaying client decision to manager {garage_number}")
+            send_whatsapp_message(
+                to_number=garage_number,
+                body_content=manager_message,
+                from_number=To or os.environ.get("TWILIO_NUMBER", "")
+            )
+            
+            # Clean up the session
+            PENDING_VALIDATIONS.pop(From, None)
+            
+            # Respond to the client to confirm we received their choice
+            client_reply = "Merci pour votre réponse. Elle a bien été transmise au garage."
+            return build_twiml_response(client_reply)
+        else:
+            logger.warning(f"Received client response '{client_response}' from {From} but no pending session found.")
+            return build_twiml_response("Merci pour votre réponse. Aucune demande en attente n'a été trouvée pour ce numéro.")
+
     # 1. Extract and sanitize the plate string (Caption)
     license_plate = "A_TRAITER_SANS_PLAQUE"
+    is_devis = False
+    client_number = None
+    
     if Body:
-        # Strip trailing and leading spaces, and convert to uppercase
-        cleaned_body = Body.strip().upper()
-        if cleaned_body:
-            # Clean up duplicate whitespace, newlines, and tabs inside the caption
-            cleaned_body = " ".join(cleaned_body.split())
-            license_plate = cleaned_body
+        # Extract potential phone number
+        phone_matches = re.findall(r'(\+?[0-9][0-9\s\-\.]{7,15}[0-9])', Body)
+        temp_body = Body
+        for match in phone_matches:
+            # Clean and validate if it looks like a phone number
+            cleaned_phone = re.sub(r'[\s\-\.]', '', match)
+            if len(cleaned_phone) >= 9 and len(cleaned_phone) <= 15 and (cleaned_phone.startswith('+') or cleaned_phone.startswith('0')):
+                client_number = cleaned_phone
+                # Remove this phone number from the plate string
+                temp_body = temp_body.replace(match, "")
+                break
+                
+        # Detect and clean keywords "devis" or "budget"
+        body_lower = temp_body.lower()
+        if "devis" in body_lower or "budget" in body_lower:
+            is_devis = True
+            for kw in ["devis", "budget"]:
+                # Case-insensitive replacement
+                pattern = re.compile(re.escape(kw), re.IGNORECASE)
+                temp_body = pattern.sub("", temp_body)
+                
+        # Clean remaining characters as the license plate
+        temp_plate = temp_body.strip()
+        temp_plate = " ".join(temp_plate.split()).upper()
+        if temp_plate:
+            license_plate = temp_plate
             
-    logger.info(f"Extracted and sanitized folder target name: '{license_plate}'")
+    logger.info(f"Extracted and sanitized folder target name: '{license_plate}', is_devis: {is_devis}, client_number: {client_number}")
     
     # 2. Safety check: Ensure media URL actually exists
     if not MediaUrl0:
@@ -318,8 +489,36 @@ async def webhook_whatsapp(
         # 8. Upload direct to Google Drive folder
         upload_file_to_folder(drive_service, folder_id, file_bytes, filename)
         
+        # 8b. If it was a devis/budget request, send interactive validation message to client
+        validation_sent = False
+        if is_devis and From:
+            target_client_number = client_number or os.getenv("DEBUG_CLIENT_NUMBER")
+            if target_client_number:
+                formatted_client = format_to_e164(target_client_number)
+                client_key = formatted_client if formatted_client.startswith("whatsapp:") else f"whatsapp:{formatted_client}"
+                
+                # Store in session (both From and To numbers are tracked to handle reply)
+                PENDING_VALIDATIONS[client_key] = {
+                    "plate": license_plate,
+                    "garage_number": From
+                }
+                
+                logger.info(f"Triggering instant customer validation for {client_key} on plate {license_plate}")
+                # We send from the same Twilio number (To parameter of current request)
+                validation_sent = send_validation_buttons(
+                    client_number=formatted_client,
+                    plate=license_plate,
+                    from_number=To or os.environ.get("TWILIO_NUMBER", "")
+                )
+        
         # 9. Return beautiful, compliant TwiML XML to confirm
         logger.info(f"Transaction successfully processed for '{license_plate}'. Returning Twilio success response.")
+        if is_devis:
+            if validation_sent:
+                return build_twiml_response(f"✅ Photo enregistrée et demande de validation envoyée au client pour le véhicule {license_plate}.")
+            else:
+                return build_twiml_response(f"✅ Photo enregistrée pour le véhicule {license_plate}, mais l'envoi de la validation client a échoué (vérifiez le numéro client et la configuration).")
+                
         return build_twiml_response(f"✅ Photo enregistrée dans le dossier {license_plate}")
         
     except Exception as e:

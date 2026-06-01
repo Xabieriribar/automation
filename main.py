@@ -20,6 +20,9 @@ from googleapiclient.http import MediaIoBaseUpload
 
 from pydantic import BaseModel
 
+# PDF Generation library imports
+from fpdf import FPDF
+
 # Setup highly informative and clean logging
 logging.basicConfig(
     level=logging.INFO,
@@ -34,7 +37,7 @@ load_dotenv()
 app = FastAPI(
     title="Garage Twilio-Google Drive Webhook",
     description="Middleware connecting Twilio WhatsApp to Google Drive and Gemini AI services",
-    version="1.4.0"
+    version="1.5.0"
 )
 
 # Enable CORS for Chrome Extension requests
@@ -364,7 +367,7 @@ def analyze_mechanic_message_with_gemini(text: str) -> Optional[dict]:
     Règles d'analyse :
     1. "is_validation_request" (boolean) : Doit être true si le message indique la détection d'une anomalie, d'une pièce usée, d'un problème sur le véhicule, d'un devis ou d'un budget qui nécessite de demander l'accord/la validation du client pour effectuer des travaux supplémentaires. Par exemple, si le mécanicien mentionne des plaquettes de frein usées, une fuite, ou écrit des mots comme "devis", "budget", "à changer", "à réparer".
     2. "license_plate" (string) : Extrais la plaque d'immatriculation suisse ou française (ex: "VD 123456", "GE 987654", "AA-123-AA"). Nettoie-la (en majuscules, espaces normaux). Si aucune plaque n'est détectable, laisse une chaîne vide "".
-    3. "client_phone" (string ou null) : Si un numéro de téléphone mobile (suisse ou international, ex: 0791234567, +4179...) est présent dans le texte pour désigner le client, extrais-le. Sinon, retourne null.
+    3. "client_phone" (string ou null) : Si un numéro de téléphone mobile (suisse ou international, ex: 0791234567, +4179...) is présent dans le texte pour désigner le client, extrais-le. Sinon, retourne null.
     4. "detected_anomaly" (string ou null) : Résume brièvement en français la pièce ou le problème à l'origine de la demande (ex: "plaquettes de frein usées", "pneu arrière lisse", "fuite de liquide de refroidissement"). Max 4-5 mots. Si aucun problème n'est identifiable, retourne null.
 
     Renvoie UNIQUEMENT un objet JSON valide (sans formatage Markdown ```json, sans texte avant ni après).
@@ -600,6 +603,154 @@ def generate_devis_with_gemini(webpage_text: str, margin_percentage: float) -> O
         logger.error(f"Failed to generate devis with Gemini: {e}")
         return None
 
+# =====================================================================
+# --- PDF Generation: Swiss Atelier Layout Class & Helper ---
+# =====================================================================
+
+class SwissDevisPDF(FPDF):
+    """
+    Custom PDF class structured to match high-end A4 Swiss corporate standards.
+    """
+    def header(self):
+        # Top brand banner
+        self.set_fill_color(15, 23, 42) # Slate 900
+        self.rect(0, 0, 210, 8, 'F')
+        
+        self.set_y(15)
+        # Title of the PDF
+        self.set_font('helvetica', 'B', 15)
+        self.set_text_color(15, 23, 42) # Slate 900
+        self.cell(0, 10, "DEVIS DE RÉPARATION AUTOMOBILE", ln=True, align='L')
+        
+        # Horizontal thin rule
+        self.set_draw_color(226, 232, 240) # Slate 200
+        self.set_line_width(0.5)
+        self.line(10, 26, 200, 26)
+        
+        # Company Info Header Card (Right aligned)
+        self.set_y(12)
+        self.set_font('helvetica', 'B', 9)
+        self.set_text_color(51, 65, 85) # Slate 700
+        self.cell(0, 4, "Garage Automobile de Lausanne", ln=True, align='R')
+        self.set_font('helvetica', '', 8)
+        self.set_text_color(100, 116, 139) # Slate 500
+        self.cell(0, 4, "Rue de la Gare 12, 1000 Lausanne", ln=True, align='R')
+        self.cell(0, 4, "IDE/TVA: CHE-123.456.789 TVA", ln=True, align='R')
+        
+        self.set_y(32) # Reset writing pointer beneath headers
+        
+    def footer(self):
+        # Keep legal footer 3 cm above the bottom of A4
+        self.set_y(-28)
+        self.set_font('helvetica', 'I', 7)
+        self.set_text_color(100, 116, 139) # Slate 500
+        
+        # Fine separator rule above bottom text
+        self.set_draw_color(241, 245, 249) # Slate 100
+        self.set_line_width(0.5)
+        self.line(10, 265, 200, 265)
+        
+        # Official Swiss legal compliance text
+        legal_text = (
+            "Conditions et Mentions Légales :\n"
+            "Ce devis est valable pour une durée de 30 jours à compter de sa date d'émission. "
+            "Conformément à l'Article 375 du Code des Obligations Suisse (CO), une tolérance empirique de 10% "
+            "sur le montant total estimé hors taxes est admise en cas de travaux supplémentaires imprévus "
+            "nécessaires à la sécurité du véhicule."
+        )
+        self.multi_cell(0, 3.5, legal_text, align='C')
+
+def create_devis_pdf(devis_text: str, plate: str) -> bytes:
+    """
+    Parses the generated Gemini estimate text and produces a high-fidelity, beautifully styled PDF.
+    """
+    pdf = SwissDevisPDF()
+    pdf.set_auto_page_break(auto=True, margin=35)
+    pdf.add_page()
+    
+    # Metadata info card (Light blue glass effect)
+    pdf.set_fill_color(248, 250, 252) # Light slate 50
+    pdf.set_draw_color(226, 232, 240) # Slate 200
+    pdf.rect(10, 32, 190, 24, style='DF')
+    
+    # Write metadata texts
+    pdf.set_y(35)
+    pdf.set_font('helvetica', 'B', 10)
+    pdf.set_text_color(51, 65, 85) # Slate 700
+    pdf.cell(95, 5, f"  VÉHICULE : {plate.upper()}", ln=False)
+    
+    swiss_tz = pytz.timezone("Europe/Zurich")
+    now_swiss = datetime.now(swiss_tz)
+    date_str = now_swiss.strftime("%d.%m.%Y à %H:%M")
+    pdf.cell(95, 5, f"DATE D'ÉMISSION : {date_str}  ", ln=True, align='R')
+    
+    pdf.set_font('helvetica', '', 9)
+    pdf.cell(95, 5, "  STATUT : Devis estimatif officiel", ln=False)
+    pdf.cell(95, 5, "LIEU : Lausanne, Suisse  ", ln=True, align='R')
+    
+    pdf.ln(12)
+    
+    # Render devis lines
+    pdf.set_font('helvetica', '', 10)
+    pdf.set_text_color(15, 23, 42) # Slate 900
+    
+    # Parse devis lines
+    for line in devis_text.split('\n'):
+        line_stripped = line.strip()
+        if not line_stripped:
+            pdf.ln(3)
+            continue
+            
+        # Clean redundant text blocks re-emitted by Gemini since they are rendered natively in headers/footers
+        if "DEVIS" in line_stripped.upper() and ("REPARATION" in line_stripped.upper() or "AUTOMOBILE" in line_stripped.upper()):
+            continue
+        if "CONDITIONS ET MENTIONS LÉGALES" in line_stripped.upper() or "ARTICLE 375" in line_stripped:
+            continue
+        if "CE DEVIS EST VALABLE" in line_stripped.upper() or "TOLÉRANCE EMPIRIQUE" in line_stripped.upper():
+            continue
+        if "GARAGE AUTOMOBILE DE LAUSANNE" in line_stripped.upper():
+            continue
+            
+        # Structure parsing for titles, listings, and sums
+        if line_stripped.startswith("###") or line_stripped.startswith("##"):
+            cleaned_title = re.sub(r'^[#\s]+', '', line_stripped)
+            pdf.ln(4)
+            pdf.set_font('helvetica', 'B', 11)
+            pdf.set_text_color(37, 99, 235) # Blue 600
+            pdf.cell(0, 6, cleaned_title, ln=True)
+            pdf.set_font('helvetica', '', 10)
+            pdf.set_text_color(15, 23, 42)
+            pdf.ln(2)
+        elif line_stripped.startswith("-") or line_stripped.startswith("*"):
+            cleaned_item = re.sub(r'^[-*\s]+', '', line_stripped)
+            pdf.set_font('helvetica', '', 9.5)
+            pdf.cell(5, 5, chr(149), ln=False, align='C') # elegant listing dot
+            pdf.multi_cell(0, 5, cleaned_item)
+            pdf.set_font('helvetica', '', 10)
+        elif any(total_kw in line_stripped.upper() for total_kw in ["TOTAL", "TVA", "À PAYER"]):
+            pdf.ln(2)
+            pdf.set_font('helvetica', 'B', 10.5)
+            pdf.set_text_color(15, 23, 42)
+            
+            # Subtle grey highlight bar for totals
+            x, y = pdf.get_x(), pdf.get_y()
+            pdf.set_fill_color(241, 245, 249) # Light Slate 100
+            pdf.rect(10, y, 190, 7, 'F')
+            pdf.set_xy(x, y)
+            
+            pdf.cell(0, 7, f"  {line_stripped}", ln=True)
+            pdf.set_font('helvetica', '', 10)
+            pdf.ln(2)
+        else:
+            pdf.multi_cell(0, 5.5, line_stripped)
+            
+    # Output raw document bytes in memory
+    return pdf.output()
+
+# =====================================================================
+# --- Twilio Features helper functions ---
+# =====================================================================
+
 def send_validation_buttons(client_number: str, plate: str, from_number: str, detected_anomaly: Optional[str] = None) -> bool:
     """
     Sends interactive buttons (Quick Replies) or fallback interactive instructions to the client.
@@ -691,7 +842,10 @@ class DevisRequest(BaseModel):
 async def api_generate_devis(request: DevisRequest):
     """
     Endpoint called by the Chrome Extension to generate a professional Swiss repair estimate (devis)
-    from extracted webpage shopping cart text, and save it directly in Google Drive.
+    from extracted webpage shopping cart text.
+    It automatically produces both:
+    1. A devis_[timestamp].txt text file saved in the corresponding Drive folder.
+    2. A beautifully formatted corporate devis_[timestamp].pdf A4 document saved in the same Drive folder.
     """
     logger.info(f"Received devis generation request for plate: '{request.license_plate}', margin: {request.margin_percentage}%")
     
@@ -699,7 +853,7 @@ async def api_generate_devis(request: DevisRequest):
         return {"error": "Le texte de la page web est vide."}
         
     try:
-        # 1. Generate estimate using Gemini
+        # 1. Generate text estimate using Gemini
         devis_text = generate_devis_with_gemini(request.webpage_text, request.margin_percentage or 20.0)
         if not devis_text:
             return {"error": "Impossible de générer le devis avec l'IA."}
@@ -725,23 +879,39 @@ async def api_generate_devis(request: DevisRequest):
         swiss_tz = pytz.timezone("Europe/Zurich")
         now_swiss = datetime.now(swiss_tz)
         timestamp = now_swiss.strftime("%Y%m%d_%H%M%S")
-        filename = f"devis_{timestamp}.txt"
         
-        # 6. Upload text to Google Drive folder
+        txt_filename = f"devis_{timestamp}.txt"
+        pdf_filename = f"devis_{timestamp}.pdf"
+        
+        # 6. Upload original TEXT file to Google Drive folder
         devis_bytes = devis_text.encode("utf-8")
         upload_file_to_folder(
             drive_service=drive_service,
             folder_id=folder_id,
             file_content=devis_bytes,
-            filename=filename,
+            filename=txt_filename,
             mimetype="text/plain"
         )
         
-        logger.info(f"Professional devis generated and saved in Google Drive: {filename} under folder {plate}")
+        # 7. Generate professional PDF file in memory
+        logger.info("Generating Swiss corporate devis PDF document...")
+        pdf_bytes = create_devis_pdf(devis_text, plate)
+        
+        # 8. Upload the PDF file to the same Google Drive folder
+        upload_file_to_folder(
+            drive_service=drive_service,
+            folder_id=folder_id,
+            file_content=pdf_bytes,
+            filename=pdf_filename,
+            mimetype="application/pdf"
+        )
+        
+        logger.info(f"Professional text & PDF devis generated and saved in Google Drive under folder {plate}")
         return {
             "success": True,
             "plate": plate,
-            "filename": filename,
+            "filename_txt": txt_filename,
+            "filename_pdf": pdf_filename,
             "devis": devis_text
         }
         

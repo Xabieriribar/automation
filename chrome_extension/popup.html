@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <title>Garage Devis Automatique</title>
+  <style>
+    :root {
+      --bg-gradient: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+      --accent: linear-gradient(90deg, #3b82f6 0%, #2563eb 100%);
+      --accent-hover: linear-gradient(90deg, #2563eb 0%, #1d4ed8 100%);
+      --glass-bg: rgba(255, 255, 255, 0.05);
+      --glass-border: rgba(255, 255, 255, 0.1);
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+    }
+
+    body {
+      width: 360px;
+      margin: 0;
+      padding: 20px;
+      background: var(--bg-gradient);
+      color: var(--text);
+      font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      box-sizing: border-box;
+    }
+
+    h2 {
+      margin-top: 0;
+      font-size: 20px;
+      font-weight: 700;
+      background: linear-gradient(90deg, #60a5fa, #3b82f6);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      text-align: center;
+      margin-bottom: 20px;
+      letter-spacing: -0.5px;
+    }
+
+    .form-group {
+      margin-bottom: 16px;
+    }
+
+    label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    input, select {
+      width: 100%;
+      padding: 10px 12px;
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 14px;
+      box-sizing: border-box;
+      transition: all 0.3s ease;
+    }
+
+    input:focus, select:focus {
+      outline: none;
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+    }
+
+    button.btn-primary {
+      width: 100%;
+      padding: 12px;
+      background: var(--accent);
+      border: none;
+      border-radius: 8px;
+      color: white;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    button.btn-primary:hover {
+      background: var(--accent-hover);
+      transform: translateY(-1px);
+      box-shadow: 0 10px 15px -3px rgba(37, 99, 235, 0.3), 0 4px 6px -2px rgba(37, 99, 235, 0.05);
+    }
+
+    button.btn-primary:active {
+      transform: translateY(0);
+    }
+
+    button.btn-secondary {
+      padding: 8px 12px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    button.btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.15);
+    }
+
+    .loader {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      margin: 20px 0;
+    }
+
+    .spinner {
+      width: 36px;
+      height: 36px;
+      border: 3px solid rgba(255, 255, 255, 0.1);
+      border-radius: 50%;
+      border-top-color: #3b82f6;
+      animation: spin 1s ease-in-out infinite;
+    }
+
+    .loader-text {
+      margin-top: 12px;
+      font-size: 13px;
+      color: var(--text-muted);
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+
+    .results-container {
+      display: none;
+      margin-top: 20px;
+      background: rgba(0, 0, 0, 0.2);
+      border: 1px solid var(--glass-border);
+      border-radius: 8px;
+      padding: 12px;
+    }
+
+    .results-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+      padding-bottom: 8px;
+    }
+
+    .results-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #60a5fa;
+    }
+
+    .button-group {
+      display: flex;
+      gap: 8px;
+    }
+
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      font-family: 'Courier New', Courier, monospace;
+      font-size: 11px;
+      color: #e2e8f0;
+      max-height: 200px;
+      overflow-y: auto;
+      background: rgba(0, 0, 0, 0.3);
+      padding: 10px;
+      border-radius: 6px;
+    }
+
+    .footer {
+      margin-top: 20px;
+      text-align: center;
+      font-size: 10px;
+      color: var(--text-muted);
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 0.6; }
+      50% { opacity: 1; }
+    }
+  </style>
+</head>
+<body>
+  <h2>Garage Devis Automatique</h2>
+  
+  <div class="form-group">
+    <label for="backend-url">Adresse du Serveur</label>
+    <input type="text" id="backend-url" value="http://localhost:8000" placeholder="https://garage-api.onrender.com">
+  </div>
+
+  <div class="form-group">
+    <label for="plate">Plaque d'immatriculation</label>
+    <input type="text" id="plate" placeholder="Ex: VD 123456" required>
+  </div>
+
+  <div class="form-group">
+    <label for="margin">Marge bénéficiaire (%)</label>
+    <select id="margin">
+      <option value="10">10%</option>
+      <option value="15">15%</option>
+      <option value="20" selected>20% (Par défaut)</option>
+      <option value="25">25%</option>
+      <option value="30">30%</option>
+      <option value="40">40%</option>
+      <option value="50">50%</option>
+    </select>
+  </div>
+
+  <button id="generate-btn" class="btn-primary">Générer le Devis</button>
+
+  <div id="loader" class="loader">
+    <div class="spinner"></div>
+    <div class="loader-text">Extraction et génération du Devis par l'IA...</div>
+  </div>
+
+  <div id="results" class="results-container">
+    <div class="results-header">
+      <span class="results-title">📄 Devis Généré</span>
+      <div class="button-group">
+        <button id="copy-btn" class="btn-secondary">Copier</button>
+        <button id="share-btn" class="btn-secondary">WhatsApp</button>
+      </div>
+    </div>
+    <pre id="devis-text"></pre>
+  </div>
+
+  <div class="footer">
+    Propulsé par Google Gemini AI & FastAPI
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

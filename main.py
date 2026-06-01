@@ -18,6 +18,8 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
+from pydantic import BaseModel
+
 # Setup highly informative and clean logging
 logging.basicConfig(
     level=logging.INFO,
@@ -32,10 +34,10 @@ load_dotenv()
 app = FastAPI(
     title="Garage Twilio-Google Drive Webhook",
     description="Middleware connecting Twilio WhatsApp to Google Drive and Gemini AI services",
-    version="1.2.0"
+    version="1.3.0"
 )
 
-# Optional: Add CORS support just in case
+# Enable CORS for Chrome Extension requests
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -361,7 +363,7 @@ def analyze_mechanic_message_with_gemini(text: str) -> Optional[dict]:
     Analyse ce texte pour remplir l'objet JSON ci-dessous.
     Règles d'analyse :
     1. "is_validation_request" (boolean) : Doit être true si le message indique la détection d'une anomalie, d'une pièce usée, d'un problème sur le véhicule, d'un devis ou d'un budget qui nécessite de demander l'accord/la validation du client pour effectuer des travaux supplémentaires. Par exemple, si le mécanicien mentionne des plaquettes de frein usées, une fuite, ou écrit des mots comme "devis", "budget", "à changer", "à réparer".
-    2. "license_plate" (string) : Extrais la plaque d'immatriculation suisse ou française (ex: "VD 123456", "GE 987654", "AA-123-AA"). Nettoie-la (en majuscules, espaces nomades). Si aucune plaque n'est détectable, laisse une chaîne vide "".
+    2. "license_plate" (string) : Extrais la plaque d'immatriculation suisse ou française (ex: "VD 123456", "GE 987654", "AA-123-AA"). Nettoie-la (en majuscules, espaces normaux). Si aucune plaque n'est détectable, laisse une chaîne vide "".
     3. "client_phone" (string ou null) : Si un numéro de téléphone mobile (suisse ou international, ex: 0791234567, +4179...) est présent dans le texte pour désigner le client, extrais-le. Sinon, retourne null.
     4. "detected_anomaly" (string ou null) : Résume brièvement en français la pièce ou le problème à l'origine de la demande (ex: "plaquettes de frein usées", "pneu arrière lisse", "fuite de liquide de refroidissement"). Max 4-5 mots. Si aucun problème n'est identifiable, retourne null.
 
@@ -416,7 +418,7 @@ def transcribe_and_summarize_audio_with_gemini(audio_bytes: bytes, mime_type: st
         return None
         
     model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key=api_key"
     
     # Base64 encode the audio binary payload
     base64_audio = base64.b64encode(audio_bytes).decode("utf-8")
@@ -471,7 +473,7 @@ def analyze_delivery_note_with_gemini(image_bytes: bytes, mime_type: str) -> Opt
         return None
         
     model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key=api_key"
     
     # Base64 encode the image payload
     base64_image = base64.b64encode(image_bytes).decode("utf-8")
@@ -515,6 +517,65 @@ def analyze_delivery_note_with_gemini(image_bytes: bytes, mime_type: str) -> Opt
             return None
     except Exception as e:
         logger.error(f"Failed to analyze delivery note with Gemini: {e}")
+        return None
+
+def generate_devis_with_gemini(webpage_text: str, margin_percentage: float) -> Optional[str]:
+    """
+    Calls the Google Gemini API to analyze raw parts catalog cart text, extract articles,
+    apply a sales markup, and generate a professional Swiss repair estimate (devis) in French.
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        logger.error("GEMINI_API_KEY is not configured in .env. Cannot generate devis.")
+        return None
+        
+    model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    
+    prompt = f"""
+    Tu es un secrétaire d'atelier automobile expert en Suisse. Tu reçois le texte brut extrait d'une page de panier d'achat de pièces de rechange (contenant des noms de pièces, des prix bruts B2B ou B2C, des quantités, etc.).
+    
+    Ton travail est de :
+    1. Nettoyer et extraire la liste des pièces détachées (nom, quantité, prix d'origine).
+    2. Calculer le nouveau prix de vente client en appliquant une marge bénéficiaire de {margin_percentage}% sur le prix de chaque pièce.
+    3. Présenter un devis professionnel suisse rédigé en français et structuré comme suit :
+       - Un en-tête professionnel de garage ("DEVIS DE RÉPARATION AUTOMOBILE").
+       - Le nom du Fournisseur identifié (ex: Derendinger, Technomag, Oscaro, etc.).
+       - La liste claire des pièces avec leur prix unitaire calculé (prix avec marge appliquée) et le total par ligne de pièces.
+       - Le total brut HT (Hors Taxes).
+       - Le calcul de la TVA suisse de 8.1% et son montant.
+       - Le montant Total TTC (Toutes Taxes Comprises) en CHF.
+       
+    Texte brut extrait du panier d'achat :
+    "{webpage_text}"
+    
+    Retourne UNIQUEMENT le texte propre et rédigé du Devis, prêt à être envoyé ou imprimé pour le client. Sois très rigoureux sur les calculs mathématiques et la présentation.
+    """
+    
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ]
+    }
+    
+    try:
+        logger.info(f"Calling Gemini API ({model}) to generate repair estimate (devis)...")
+        response = requests.post(url, headers=headers, json=payload, timeout=25)
+        if response.status_code == 200:
+            result = response.json()
+            text_response = result['candidates'][0]['content']['parts'][0]['text']
+            logger.info("Gemini successfully generated the professional devis.")
+            return text_response.strip()
+        else:
+            logger.error(f"Gemini API returned error for devis generation: {response.status_code}. Response: {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Failed to generate devis with Gemini: {e}")
         return None
 
 def send_validation_buttons(client_number: str, plate: str, from_number: str, detected_anomaly: Optional[str] = None) -> bool:
@@ -594,6 +655,81 @@ async def health_check():
     except Exception:
         status_info["google_drive"] = "error"
     return status_info
+
+# =====================================================================
+# --- Chrome Extension /api/generate-devis API Endpoint ---
+# =====================================================================
+
+class DevisRequest(BaseModel):
+    webpage_text: str
+    license_plate: str
+    margin_percentage: Optional[float] = 20.0
+
+@app.post("/api/generate-devis", tags=["Devis"])
+async def api_generate_devis(request: DevisRequest):
+    """
+    Endpoint called by the Chrome Extension to generate a professional Swiss repair estimate (devis)
+    from extracted webpage shopping cart text, and save it directly in Google Drive.
+    """
+    logger.info(f"Received devis generation request for plate: '{request.license_plate}', margin: {request.margin_percentage}%")
+    
+    if not request.webpage_text:
+        return {"error": "Le texte de la page web est vide."}
+        
+    try:
+        # 1. Generate estimate using Gemini
+        devis_text = generate_devis_with_gemini(request.webpage_text, request.margin_percentage or 20.0)
+        if not devis_text:
+            return {"error": "Impossible de générer le devis avec l'IA."}
+            
+        # 2. Extract Swiss license plate
+        plate = extract_swiss_plate(request.license_plate)
+        if not plate:
+            # Fallback if no valid Swiss format was input
+            plate = request.license_plate.strip().upper() or "A_TRAITER_SANS_PLAQUE"
+            
+        # 3. Get authenticated Drive service
+        drive_service = get_drive_service()
+        
+        parent_folder_id = os.getenv("GOOGLE_DRIVE_PARENT_FOLDER_ID")
+        if not parent_folder_id:
+            logger.critical("GOOGLE_DRIVE_PARENT_FOLDER_ID is missing from config.")
+            return {"error": "Configuration du Google Drive manquante."}
+            
+        # 4. Resolve folder for the plate
+        folder_id = get_or_create_subfolder(drive_service, parent_folder_id, plate)
+        
+        # 5. Generate unique filename with timestamp
+        swiss_tz = pytz.timezone("Europe/Zurich")
+        now_swiss = datetime.now(swiss_tz)
+        timestamp = now_swiss.strftime("%Y%m%d_%H%M%S")
+        filename = f"devis_{timestamp}.txt"
+        
+        # 6. Upload text to Google Drive folder
+        devis_bytes = devis_text.encode("utf-8")
+        upload_file_to_folder(
+            drive_service=drive_service,
+            folder_id=folder_id,
+            file_content=devis_bytes,
+            filename=filename,
+            mimetype="text/plain"
+        )
+        
+        logger.info(f"Professional devis generated and saved in Google Drive: {filename} under folder {plate}")
+        return {
+            "success": True,
+            "plate": plate,
+            "filename": filename,
+            "devis": devis_text
+        }
+        
+    except Exception as e:
+        logger.exception("An error occurred during devis generation and storage:")
+        return {"error": f"Échec du traitement : {str(e)}"}
+
+# =====================================================================
+# --- Twilio Incoming WhatsApp Webhook Router ---
+# =====================================================================
 
 @app.post("/webhook/whatsapp", tags=["Webhooks"])
 async def webhook_whatsapp(
@@ -753,7 +889,7 @@ async def webhook_whatsapp(
             logger.info(f"Successfully saved delivery note image temporarily to: {image_path}")
             
             # Process with Google Gemini multimodal capabilities (vision)
-            logger.info("Analyzing delivery note image via Gemini Vision...")
+            logger.info("Analyse du bon de livraison par Gemini...")
             extraction = analyze_delivery_note_with_gemini(file_bytes, MediaContentType0)
             
             if not extraction:

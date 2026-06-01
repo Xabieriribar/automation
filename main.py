@@ -322,7 +322,74 @@ def send_whatsapp_message(to_number: str, body_content: str, from_number: str, c
         logger.error(f"Error during REST API fallback call: {e}")
         return None
 
-def send_validation_buttons(client_number: str, plate: str, from_number: str) -> bool:
+def analyze_mechanic_message_with_gemini(text: str) -> Optional[dict]:
+    """
+    Calls the Google Gemini API to analyze the mechanic's message, extracting the license plate,
+    checking if work/budget validation is requested, finding a potential customer phone,
+    and summarizing the anomaly/problem detected.
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        logger.warning("GEMINI_API_KEY is not configured in .env. Skipping Gemini AI analysis.")
+        return None
+        
+    model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    
+    prompt = f"""
+    Tu es un assistant IA expert intégré au système d'un garage automobile. Ton rôle est d'analyser le message saisi par un mécanicien (contenant une photo de diagnostic) et d'en extraire des informations structurées.
+    
+    Message du mécanicien : "{text}"
+    
+    Analyse ce texte pour remplir l'objet JSON ci-dessous.
+    Règles d'analyse :
+    1. "is_validation_request" (boolean) : Doit être true si le message indique la détection d'une anomalie, d'une pièce usée, d'un problème sur le véhicule, d'un devis ou d'un budget qui nécessite de demander l'accord/la validation du client pour effectuer des travaux supplémentaires. Par exemple, si le mécanicien mentionne des plaquettes de frein usées, une fuite, ou écrit des mots comme "devis", "budget", "à changer", "à réparer".
+    2. "license_plate" (string) : Extrais la plaque d'immatriculation suisse ou française (ex: "VD 123456", "GE 987654", "AA-123-AA"). Nettoie-la (en majuscules, espaces normaux). Si aucune plaque n'est détectable, laisse une chaîne vide "".
+    3. "client_phone" (string ou null) : Si un numéro de téléphone mobile (suisse ou international, ex: 0791234567, +4179...) est présent dans le texte pour désigner le client, extrais-le. Sinon, retourne null.
+    4. "detected_anomaly" (string ou null) : Résume brièvement en français la pièce ou le problème à l'origine de la demande (ex: "plaquettes de frein usées", "pneu arrière lisse", "fuite de liquide de refroidissement"). Max 4-5 mots. Si aucun problème n'est identifiable, retourne null.
+
+    Renvoie UNIQUEMENT un objet JSON valide (sans formatage Markdown ```json, sans texte avant ni après).
+    Exemple de réponse attendue :
+    {{
+        "is_validation_request": true,
+        "license_plate": "VD 123456",
+        "client_phone": "0791234567",
+        "detected_anomaly": "plaquettes de frein usées"
+    }}
+    """
+    
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json"
+        }
+    }
+    
+    try:
+        logger.info(f"Calling Gemini API ({model}) for analysis...")
+        response = requests.post(url, headers=headers, json=payload, timeout=12)
+        if response.status_code == 200:
+            result = response.json()
+            # Extract text response from Gemini structure
+            text_response = result['candidates'][0]['content']['parts'][0]['text']
+            parsed_data = json.loads(text_response.strip())
+            logger.info(f"Gemini AI Successfully parsed structured data: {parsed_data}")
+            return parsed_data
+        else:
+            logger.error(f"Gemini API returned an error status: {response.status_code}. Response: {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Failed to analyze message with Gemini: {e}")
+        return None
+
+def send_validation_buttons(client_number: str, plate: str, from_number: str, detected_anomaly: Optional[str] = None) -> bool:
     """
     Sends interactive buttons (Quick Replies) or fallback interactive instructions to the client.
     """
@@ -336,11 +403,12 @@ def send_validation_buttons(client_number: str, plate: str, from_number: str) ->
     target_number = format_to_e164(target_number)
     content_sid = os.getenv("TWILIO_CONTENT_SID")
     
-    body = f"Bonjour, le garage a détecté une anomalie sur votre véhicule {plate}. Veuillez valider ou refuser les réparations supplémentaires via les boutons ci-dessous :"
+    anomaly_part = f" ({detected_anomaly})" if detected_anomaly else ""
+    body = f"Bonjour, le garage a détecté une anomalie{anomaly_part} sur votre véhicule {plate}. Veuillez valider ou refuser les réparations supplémentaires via les boutons ci-dessous :"
     
     if content_sid:
         # Use Twilio Content API template
-        content_variables = json.dumps({"1": plate})
+        content_variables = json.dumps({"1": plate, "2": detected_anomaly or "une anomalie"})
         logger.info(f"Sending interactive WhatsApp buttons via Template {content_sid} to client {target_number}")
         sid = send_whatsapp_message(
             to_number=target_number,
@@ -427,36 +495,50 @@ async def webhook_whatsapp(
     license_plate = "A_TRAITER_SANS_PLAQUE"
     is_devis = False
     client_number = None
+    detected_anomaly = None
     
     if Body:
-        # Extract potential phone number
-        phone_matches = re.findall(r'(\+?[0-9][0-9\s\-\.]{7,15}[0-9])', Body)
-        temp_body = Body
-        for match in phone_matches:
-            # Clean and validate if it looks like a phone number
-            cleaned_phone = re.sub(r'[\s\-\.]', '', match)
-            if len(cleaned_phone) >= 9 and len(cleaned_phone) <= 15 and (cleaned_phone.startswith('+') or cleaned_phone.startswith('0')):
-                client_number = cleaned_phone
-                # Remove this phone number from the plate string
-                temp_body = temp_body.replace(match, "")
-                break
-                
-        # Detect and clean keywords "devis" or "budget"
-        body_lower = temp_body.lower()
-        if "devis" in body_lower or "budget" in body_lower:
-            is_devis = True
-            for kw in ["devis", "budget"]:
-                # Case-insensitive replacement
-                pattern = re.compile(re.escape(kw), re.IGNORECASE)
-                temp_body = pattern.sub("", temp_body)
-                
-        # Clean remaining characters as the license plate
-        temp_plate = temp_body.strip()
-        temp_plate = " ".join(temp_plate.split()).upper()
-        if temp_plate:
-            license_plate = temp_plate
+        # 1a. Try Gemini Analysis first if API key is configured
+        gemini_result = None
+        if os.getenv("GEMINI_API_KEY"):
+            logger.info("GEMINI_API_KEY found. Analyzing message using Gemini intermediate intelligence layer...")
+            gemini_result = analyze_mechanic_message_with_gemini(Body)
             
-    logger.info(f"Extracted and sanitized folder target name: '{license_plate}', is_devis: {is_devis}, client_number: {client_number}")
+        if gemini_result:
+            is_devis = gemini_result.get("is_validation_request", False)
+            license_plate = gemini_result.get("license_plate", "A_TRAITER_SANS_PLAQUE") or "A_TRAITER_SANS_PLAQUE"
+            client_number = gemini_result.get("client_phone")
+            detected_anomaly = gemini_result.get("detected_anomaly")
+        else:
+            # 1b. Rule-based Fallback (Regex + keywords)
+            # Extract potential phone number
+            phone_matches = re.findall(r'(\+?[0-9][0-9\s\-\.]{7,15}[0-9])', Body)
+            temp_body = Body
+            for match in phone_matches:
+                # Clean and validate if it looks like a phone number
+                cleaned_phone = re.sub(r'[\s\-\.]', '', match)
+                if len(cleaned_phone) >= 9 and len(cleaned_phone) <= 15 and (cleaned_phone.startswith('+') or cleaned_phone.startswith('0')):
+                    client_number = cleaned_phone
+                    # Remove this phone number from the plate string
+                    temp_body = temp_body.replace(match, "")
+                    break
+                    
+            # Detect and clean keywords "devis" or "budget"
+            body_lower = temp_body.lower()
+            if "devis" in body_lower or "budget" in body_lower:
+                is_devis = True
+                for kw in ["devis", "budget"]:
+                    # Case-insensitive replacement
+                    pattern = re.compile(re.escape(kw), re.IGNORECASE)
+                    temp_body = pattern.sub("", temp_body)
+                    
+            # Clean remaining characters as the license plate
+            temp_plate = temp_body.strip()
+            temp_plate = " ".join(temp_plate.split()).upper()
+            if temp_plate:
+                license_plate = temp_plate
+            
+    logger.info(f"Extracted and sanitized folder target name: '{license_plate}', is_devis: {is_devis}, client_number: {client_number}, detected_anomaly: '{detected_anomaly}'")
     
     # 2. Safety check: Ensure media URL actually exists
     if not MediaUrl0:
@@ -503,12 +585,13 @@ async def webhook_whatsapp(
                     "garage_number": From
                 }
                 
-                logger.info(f"Triggering instant customer validation for {client_key} on plate {license_plate}")
+                logger.info(f"Triggering instant customer validation for {client_key} on plate {license_plate} (anomaly: '{detected_anomaly}')")
                 # We send from the same Twilio number (To parameter of current request)
                 validation_sent = send_validation_buttons(
                     client_number=formatted_client,
                     plate=license_plate,
-                    from_number=To or os.environ.get("TWILIO_NUMBER", "")
+                    from_number=To or os.environ.get("TWILIO_NUMBER", ""),
+                    detected_anomaly=detected_anomaly
                 )
         
         # 9. Return beautiful, compliant TwiML XML to confirm

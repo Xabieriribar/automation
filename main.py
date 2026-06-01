@@ -663,6 +663,7 @@ class SwissDevisPDF(FPDF):
 def create_devis_pdf(devis_text: str, plate: str) -> bytes:
     """
     Parses the generated Gemini estimate text and produces a high-fidelity, beautifully styled PDF.
+    Guarantees robust horizontal pointer mapping for the fpdf2 library.
     """
     pdf = SwissDevisPDF()
     pdf.set_auto_page_break(auto=True, margin=35)
@@ -673,22 +674,30 @@ def create_devis_pdf(devis_text: str, plate: str) -> bytes:
     pdf.set_draw_color(226, 232, 240) # Slate 200
     pdf.rect(10, 32, 190, 24, style='DF')
     
-    # Write metadata texts
+    # Write metadata texts using explicit position control
     pdf.set_y(35)
     pdf.set_font('helvetica', 'B', 10)
     pdf.set_text_color(51, 65, 85) # Slate 700
-    pdf.cell(95, 5, f"  VÉHICULE : {plate.upper()}", ln=False)
+    pdf.set_x(12)
+    pdf.cell(90, 5, f"VÉHICULE : {plate.upper()}")
     
     swiss_tz = pytz.timezone("Europe/Zurich")
     now_swiss = datetime.now(swiss_tz)
     date_str = now_swiss.strftime("%d.%m.%Y à %H:%M")
-    pdf.cell(95, 5, f"DATE D'ÉMISSION : {date_str}  ", ln=True, align='R')
+    pdf.set_x(102)
+    pdf.cell(95, 5, f"DATE D'ÉMISSION : {date_str}", align='R')
+    pdf.ln(5)
+    pdf.set_x(10)
     
     pdf.set_font('helvetica', '', 9)
-    pdf.cell(95, 5, "  STATUT : Devis estimatif officiel", ln=False)
-    pdf.cell(95, 5, "LIEU : Lausanne, Suisse  ", ln=True, align='R')
+    pdf.set_x(12)
+    pdf.cell(90, 5, "STATUT : Devis estimatif officiel")
+    pdf.set_x(102)
+    pdf.cell(95, 5, "LIEU : Lausanne, Suisse", align='R')
+    pdf.ln(5)
     
     pdf.ln(12)
+    pdf.set_x(10)
     
     # Render devis lines
     pdf.set_font('helvetica', '', 10)
@@ -699,6 +708,7 @@ def create_devis_pdf(devis_text: str, plate: str) -> bytes:
         line_stripped = line.strip()
         if not line_stripped:
             pdf.ln(3)
+            pdf.set_x(10)
             continue
             
         # Clean redundant text blocks re-emitted by Gemini since they are rendered natively in headers/footers
@@ -715,33 +725,45 @@ def create_devis_pdf(devis_text: str, plate: str) -> bytes:
         if line_stripped.startswith("###") or line_stripped.startswith("##"):
             cleaned_title = re.sub(r'^[#\s]+', '', line_stripped)
             pdf.ln(4)
+            pdf.set_x(10)
             pdf.set_font('helvetica', 'B', 11)
             pdf.set_text_color(37, 99, 235) # Blue 600
-            pdf.cell(0, 6, cleaned_title, ln=True)
+            pdf.cell(0, 6, cleaned_title)
+            pdf.ln(6)
+            pdf.set_x(10)
             pdf.set_font('helvetica', '', 10)
             pdf.set_text_color(15, 23, 42)
             pdf.ln(2)
+            pdf.set_x(10)
         elif line_stripped.startswith("-") or line_stripped.startswith("*"):
             cleaned_item = re.sub(r'^[-*\s]+', '', line_stripped)
             pdf.set_font('helvetica', '', 9.5)
+            pdf.set_x(10)
             pdf.multi_cell(0, 5, f"  - {cleaned_item}")
             pdf.set_font('helvetica', '', 10)
+            pdf.set_x(10)
         elif any(total_kw in line_stripped.upper() for total_kw in ["TOTAL", "TVA", "À PAYER"]):
             pdf.ln(2)
+            pdf.set_x(10)
             pdf.set_font('helvetica', 'B', 10.5)
             pdf.set_text_color(15, 23, 42)
             
             # Subtle grey highlight bar for totals
-            x, y = pdf.get_x(), pdf.get_y()
+            _, y = pdf.get_x(), pdf.get_y()
             pdf.set_fill_color(241, 245, 249) # Light Slate 100
             pdf.rect(10, y, 190, 7, 'F')
-            pdf.set_xy(x, y)
+            pdf.set_xy(10, y)
             
-            pdf.cell(0, 7, f"  {line_stripped}", ln=True)
+            pdf.cell(0, 7, f"  {line_stripped}")
+            pdf.ln(7)
+            pdf.set_x(10)
             pdf.set_font('helvetica', '', 10)
             pdf.ln(2)
+            pdf.set_x(10)
         else:
+            pdf.set_x(10)
             pdf.multi_cell(0, 5.5, line_stripped)
+            pdf.set_x(10)
             
     # Output raw document bytes in memory
     return pdf.output()

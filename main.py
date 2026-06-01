@@ -931,12 +931,17 @@ async def api_generate_devis(request: DevisRequest):
         )
         
         logger.info(f"Professional text & PDF devis generated and saved in Google Drive under folder {plate}")
+        
+        # Base64 encode the PDF bytes for client-side download capabilities
+        pdf_base64 = base64.b64encode(pdf_bytes).decode("utf-8")
+        
         return {
             "success": True,
             "plate": plate,
             "filename_txt": txt_filename,
             "filename_pdf": pdf_filename,
-            "devis": devis_text
+            "devis": devis_text,
+            "pdf_base64": pdf_base64
         }
         
     except Exception as e:

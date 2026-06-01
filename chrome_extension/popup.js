@@ -1,6 +1,7 @@
 document.addEventListener("DOMContentLoaded", () => {
   const generateBtn = document.getElementById("generate-btn");
   const copyBtn = document.getElementById("copy-btn");
+  const pdfBtn = document.getElementById("pdf-btn");
   const shareBtn = document.getElementById("share-btn");
   const plateInput = document.getElementById("plate");
   const marginSelect = document.getElementById("margin");
@@ -10,6 +11,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Production API Gateway (strictly compliant with Web Store security policies)
   const API_ENDPOINT = "https://automation-dsni.onrender.com/api/generate-devis";
+
+  // In-memory document buffers
+  let currentPdfBase64 = null;
+  let currentPlate = "devis";
 
   // Load saved configurations from Chrome Storage
   chrome.storage.local.get(["licensePlate"], (data) => {
@@ -34,6 +39,8 @@ document.addEventListener("DOMContentLoaded", () => {
     loader.style.display = "flex";
     resultsContainer.style.display = "none";
     generateBtn.disabled = true;
+    currentPdfBase64 = null;
+    currentPlate = plate;
 
     try {
       // 1. Get active browser tab
@@ -81,14 +88,53 @@ document.addEventListener("DOMContentLoaded", () => {
         throw new Error(data.error);
       }
 
-      // 4. Populate results area
+      // 4. Cache structured PDF response
       devisTextPre.textContent = data.devis;
+      currentPdfBase64 = data.pdf_base64;
+      currentPlate = data.plate || plate;
+      
       resultsContainer.style.display = "block";
     } catch (err) {
       alert(`Erreur de génération : ${err.message}`);
     } finally {
       loader.style.display = "none";
       generateBtn.disabled = false;
+    }
+  });
+
+  // Convert Base64 string to Binary Blob
+  const base64ToBlob = (base64, type = "application/pdf") => {
+    const binStr = atob(base64);
+    const len = binStr.length;
+    const arr = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      arr[i] = binStr.charCodeAt(i);
+    }
+    return new Blob([arr], { type });
+  };
+
+  // Safe client-side local A4 PDF download triggered from popup UI without storage extensions
+  pdfBtn.addEventListener("click", () => {
+    if (!currentPdfBase64) {
+      alert("Aucun fichier PDF disponible pour le téléchargement.");
+      return;
+    }
+
+    try {
+      const blob = base64ToBlob(currentPdfBase64, "application/pdf");
+      const url = URL.createObjectURL(blob);
+      
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `devis_${currentPlate.replace(/\s+/g, "_")}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      
+      // Clean up DOM and memory URL references immediately
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      alert(`Erreur lors du téléchargement du PDF : ${err.message}`);
     }
   });
 

@@ -49,7 +49,12 @@ document.addEventListener("DOMContentLoaded", () => {
         throw new Error("Aucun onglet actif détecté.");
       }
 
-      // 2. Execute content script to scrape text
+      // 2. Strict system protocol guard to prevent runtime crashes on native browser pages
+      if (tab.url.startsWith("chrome://") || tab.url.startsWith("about:") || tab.url.startsWith("moz-extension://")) {
+        throw new Error("Impossible d'analyser cette page système. Veuillez naviguer sur un site de pièces.");
+      }
+
+      // 3. Execute content script to scrape text
       const results = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         files: ["content.js"]
@@ -60,7 +65,7 @@ document.addEventListener("DOMContentLoaded", () => {
         throw new Error("Impossible d'extraire le texte de cet onglet. Assurez-vous d'être sur une page web de pièces.");
       }
 
-      // 3. Send extraction payload to the production backend
+      // 4. Send extraction payload to the production backend
       const response = await fetch(API_ENDPOINT, {
         method: "POST",
         headers: {
@@ -88,7 +93,7 @@ document.addEventListener("DOMContentLoaded", () => {
         throw new Error(data.error);
       }
 
-      // 4. Cache structured PDF response
+      // 5. Cache structured PDF response
       devisTextPre.textContent = data.devis;
       currentPdfBase64 = data.pdf_base64;
       currentPlate = data.plate || plate;

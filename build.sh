@@ -14,12 +14,13 @@ rm -f garage_devis_store.zip
 echo "Création du dossier de build dist/..."
 mkdir -p dist
 
-# 3. Copier les 4 fichiers cœurs requis de l'extension
+# 3. Copier les 4 fichiers cœurs requis de l'extension et le dossier d'icônes
 echo "Copie des fichiers de l'extension..."
 cp chrome_extension/manifest.json dist/
 cp chrome_extension/popup.html dist/
 cp chrome_extension/popup.js dist/
 cp chrome_extension/content.js dist/
+cp -r chrome_extension/icons dist/
 
 # 4. Compresser les fichiers dans une archive zip de production
 echo "Création de l'archive ZIP garage_devis_store.zip..."

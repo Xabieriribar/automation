@@ -4,6 +4,8 @@ import logging
 from datetime import datetime
 from io import BytesIO
 from typing import Optional
+import re
+import base64
 
 from fastapi import FastAPI, Form, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,8 +31,8 @@ load_dotenv()
 
 app = FastAPI(
     title="Garage Twilio-Google Drive Webhook",
-    description="Hyper-minimalist middleware connecting Twilio WhatsApp to Google Drive",
-    version="1.0.0"
+    description="Middleware connecting Twilio WhatsApp to Google Drive and Gemini AI services",
+    version="1.1.0"
 )
 
 # Optional: Add CORS support just in case
@@ -186,19 +188,19 @@ def download_twilio_media(media_url: str) -> bytes:
     else:
         logger.warning("Twilio credentials not fully set. Proceeding without auth (Secure Media must be disabled).")
         
-    logger.info(f"Downloading image asset from Twilio CDN URL: {media_url}")
+    logger.info(f"Downloading image/audio asset from Twilio CDN URL: {media_url}")
     response = requests.get(media_url, auth=auth, timeout=30)
     response.raise_for_status()
     return response.content
 
-def upload_file_to_folder(drive_service, folder_id: str, file_content: bytes, filename: str) -> str:
+def upload_file_to_folder(drive_service, folder_id: str, file_content: bytes, filename: str, mimetype: str = "image/jpeg") -> str:
     """
     Streams file bytes directly to a specific Google Drive folder.
     Includes support for Google Shared Drives.
     """
     media = MediaIoBaseUpload(
         BytesIO(file_content),
-        mimetype="image/jpeg",
+        mimetype=mimetype,
         resumable=True
     )
     
@@ -207,7 +209,7 @@ def upload_file_to_folder(drive_service, folder_id: str, file_content: bytes, fi
         "parents": [folder_id]
     }
     
-    logger.info(f"Uploading file '{filename}' to Google Drive subfolder '{folder_id}'")
+    logger.info(f"Uploading file '{filename}' ({mimetype}) to Google Drive subfolder '{folder_id}'")
     uploaded_file = drive_service.files().create(
         body=file_metadata,
         media_body=media,
@@ -231,9 +233,8 @@ def build_twiml_response(message: str) -> Response:
     return Response(content=xml_content, media_type="application/xml")
 
 # =====================================================================
-# --- Feature: Validation Client Instantanée (Approbation Budget 1-Clic) ---
+# --- Features: Validation Client & La Dictée Atelier (Gemini AI) ---
 # =====================================================================
-import re
 
 try:
     from twilio.rest import Client as TwilioClient
@@ -258,6 +259,22 @@ def format_to_e164(phone_number: str) -> str:
     if cleaned.startswith('0'):
         return '+41' + cleaned[1:]
     return cleaned
+
+def extract_swiss_plate(text: str) -> Optional[str]:
+    """
+    Tries to locate and clean a Swiss license plate from text.
+    Swiss plates: 2 capital letters (Canton code) followed by 1 to 6 digits.
+    """
+    pattern = re.compile(
+        r'\b(VD|GE|ZH|VS|FR|NE|JU|BE|UR|SZ|OW|NW|GL|ZG|SO|BS|BL|SH|AR|AI|SG|GR|AG|TG|TI)\s*([0-9]{1,6})\b',
+        re.IGNORECASE
+    )
+    match = pattern.search(text)
+    if match:
+        canton = match.group(1).upper()
+        number = match.group(2)
+        return f"{canton} {number}"
+    return None
 
 def send_whatsapp_message(to_number: str, body_content: str, from_number: str, content_sid: Optional[str] = None, content_variables: Optional[str] = None) -> Optional[str]:
     """
@@ -373,20 +390,76 @@ def analyze_mechanic_message_with_gemini(text: str) -> Optional[dict]:
     }
     
     try:
-        logger.info(f"Calling Gemini API ({model}) for analysis...")
+        logger.info(f"Calling Gemini API ({model}) for message semantic analysis...")
         response = requests.post(url, headers=headers, json=payload, timeout=12)
         if response.status_code == 200:
             result = response.json()
             # Extract text response from Gemini structure
             text_response = result['candidates'][0]['content']['parts'][0]['text']
             parsed_data = json.loads(text_response.strip())
-            logger.info(f"Gemini AI Successfully parsed structured data: {parsed_data}")
+            logger.info(f"Gemini AI successfully parsed structured data: {parsed_data}")
             return parsed_data
         else:
             logger.error(f"Gemini API returned an error status: {response.status_code}. Response: {response.text}")
             return None
     except Exception as e:
         logger.error(f"Failed to analyze message with Gemini: {e}")
+        return None
+
+def transcribe_and_summarize_audio_with_gemini(audio_bytes: bytes, mime_type: str) -> Optional[str]:
+    """
+    Calls the Google Gemini API using direct REST multimodal capabilities (inlineData) to transcribe
+    and format a mechanic's workshop voice memo in French.
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        logger.error("GEMINI_API_KEY is not configured in .env. Cannot process audio memo.")
+        return None
+        
+    model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+    # For multimodal audio payloads, we use the active Gemini model
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    
+    # Base64 encode the audio binary payload
+    base64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+    
+    prompt = (
+        "Tu es un secrétaire d'atelier automobile expert en Suisse. Écoute cet enregistrement audio d'un mécanicien. "
+        "Supprime les bruits de fond du garage, corrige la grammaire et structure proprement le texte en deux sections précises :\n"
+        "- 'Véhicule' : Indique la plaque d'immatriculation suisse détectée (ex: VD 123456).\n"
+        "- 'Détails des travaux' : Liste claire et professionnelle des réparations effectuées ou à prévoir. Conserve le jargon technique mécanique."
+    )
+    
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inlineData": {
+                            "mimeType": mime_type,
+                            "data": base64_audio
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+    
+    try:
+        logger.info(f"Uploading audio payload ({len(audio_bytes)} bytes) directly to Gemini API ({model})...")
+        response = requests.post(url, headers=headers, json=payload, timeout=40)
+        if response.status_code == 200:
+            result = response.json()
+            text_response = result['candidates'][0]['content']['parts'][0]['text']
+            logger.info("Gemini multimodal audio processing succeeded.")
+            return text_response.strip()
+        else:
+            logger.error(f"Gemini API returned an error status for audio transcription: {response.status_code}. Response: {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Failed to transcribe workshop audio via Gemini: {e}")
         return None
 
 def send_validation_buttons(client_number: str, plate: str, from_number: str, detected_anomaly: Optional[str] = None) -> bool:
@@ -434,6 +507,39 @@ def send_validation_buttons(client_number: str, plate: str, from_number: str, de
         )
         return sid is not None
 
+@app.on_event("startup")
+def startup_event():
+    """
+    Performs critical environment checks and pre-warms the Google Drive credentials.
+    Allows errors to log clearly at boot time rather than on the first request.
+    """
+    logger.info("Initializing Twilio-Google Drive Webhook Application...")
+    
+    parent_folder_id = os.getenv("GOOGLE_DRIVE_PARENT_FOLDER_ID")
+    if not parent_folder_id:
+        logger.error("WARNING: GOOGLE_DRIVE_PARENT_FOLDER_ID is missing from your configuration.")
+    else:
+        logger.info(f"Configured Parent Drive ID: '{parent_folder_id}'")
+        
+    try:
+        get_drive_service()
+        logger.info("Google Drive service successfully initialized and authenticated!")
+    except Exception as e:
+        logger.error(f"WARNING: Google Drive initialization failed at startup: {e}")
+
+@app.get("/health", tags=["Monitoring"])
+async def health_check():
+    """
+    Basic health check endpoint for monitoring systems (UptimeRobot, Render, etc.)
+    """
+    status_info = {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+    try:
+        get_drive_service()
+        status_info["google_drive"] = "connected"
+    except Exception:
+        status_info["google_drive"] = "error"
+    return status_info
+
 @app.post("/webhook/whatsapp", tags=["Webhooks"])
 async def webhook_whatsapp(
     Body: Optional[str] = Form(None),
@@ -442,12 +548,16 @@ async def webhook_whatsapp(
     From: Optional[str] = Form(None),
     To: Optional[str] = Form(None),
     ButtonText: Optional[str] = Form(None),
-    ButtonPayload: Optional[str] = Form(None)
+    ButtonPayload: Optional[str] = Form(None),
+    MediaContentType0: Optional[str] = Form(None)
 ):
     """
     Twilio Webhook endpoint. Handles incoming WhatsApp media messages and client interactive button responses.
+    Features:
+    1. "La Dictée Atelier" - Direct multimodal audio transcribing and structured documentation into Drive.
+    2. "Validation Client Instantanée" - AI-based message parser, folder resolve, and budget validation buttons.
     """
-    logger.info(f"Incoming request from {From or 'Unknown Sender'} to {To or 'Unknown Recipient'}. Body: '{Body or ''}'")
+    logger.info(f"Incoming request from {From or 'Unknown Sender'} to {To or 'Unknown Recipient'}. Body: '{Body or ''}', MediaContentType0: '{MediaContentType0 or ''}'")
     
     # 0. Check if the message is a client interactive response to a budget request
     client_response = None
@@ -491,14 +601,83 @@ async def webhook_whatsapp(
             logger.warning(f"Received client response '{client_response}' from {From} but no pending session found.")
             return build_twiml_response("Merci pour votre réponse. Aucune demande en attente n'a été trouvée pour ce numéro.")
 
-    # 1. Extract and sanitize the plate string (Caption)
+    # 1. Feature: "La Dictée Atelier" (Voice-to-Text Workshop Transcription)
+    if MediaContentType0 and MediaContentType0.startswith("audio/"):
+        logger.info("Voice message detected! Starting 'La Dictée Atelier' workflow.")
+        
+        if not MediaUrl0:
+            logger.warning("Audio content type detected but no media URL is present. Rejecting request.")
+            return build_twiml_response("❌ Erreur: Fichier audio introuvable ou non lisible.")
+            
+        try:
+            # Download audio from Twilio CDN
+            audio_bytes = download_twilio_media(MediaUrl0)
+            
+            # Save temporarily to /tmp/audio_input.ogg as required by prompt
+            os.makedirs("/tmp", exist_ok=True)
+            audio_path = "/tmp/audio_input.ogg"
+            with open(audio_path, "wb") as f:
+                f.write(audio_bytes)
+            logger.info(f"Successfully saved voice memo temporarily to: {audio_path}")
+            
+            # Process with Google Gemini multimodal capabilities
+            logger.info("Transcribing and structuring workshop voice memo via Gemini AI...")
+            transcription = transcribe_and_summarize_audio_with_gemini(audio_bytes, MediaContentType0)
+            
+            if not transcription:
+                logger.error("Failed to transcribe workshop audio via Gemini.")
+                return build_twiml_response("❌ Erreur: Impossible de transcrire la note vocale de l'atelier.")
+                
+            logger.info(f"Gemini voice transcription results:\n{transcription}")
+            
+            # Extract Swiss license plate from transcription or text body
+            plate = extract_swiss_plate(transcription)
+            if not plate and Body:
+                plate = extract_swiss_plate(Body)
+            if not plate:
+                plate = "A_TRAITER_SANS_PLAQUE"
+                
+            logger.info(f"Resolved license plate for the voice memo: '{plate}'")
+            
+            # Get authenticated Google Drive client
+            drive_service = get_drive_service()
+            
+            parent_folder_id = os.getenv("GOOGLE_DRIVE_PARENT_FOLDER_ID")
+            if not parent_folder_id:
+                logger.critical("GOOGLE_DRIVE_PARENT_FOLDER_ID is missing from .env configuration.")
+                raise ValueError("GOOGLE_DRIVE_PARENT_FOLDER_ID variable is missing.")
+                
+            # Create or resolve Google Drive subfolder for the vehicle
+            folder_id = get_or_create_subfolder(drive_service, parent_folder_id, plate)
+            
+            # Upload transcription as works summary text file
+            file_content_bytes = transcription.encode("utf-8")
+            upload_file_to_folder(
+                drive_service=drive_service,
+                folder_id=folder_id,
+                file_content=file_content_bytes,
+                filename="travaux_atelier.txt",
+                mimetype="text/plain"
+            )
+            
+            logger.info(f"Workshop note uploaded successfully to folder '{plate}' on Google Drive.")
+            
+            # Send French WhatsApp confirmation back to the mechanic
+            return build_twiml_response(f"📝 Note d'atelier enregistrée avec succès dans le dossier {plate}.")
+            
+        except Exception as e:
+            logger.exception("An error occurred during 'La Dictée Atelier' processing:")
+            return build_twiml_response("❌ Erreur: Échec du traitement de la note vocale d'atelier.")
+
+    # 2. Workflow: Photo Upload & Instant Client Validation
+    # Extract and sanitize the plate string (Caption)
     license_plate = "A_TRAITER_SANS_PLAQUE"
     is_devis = False
     client_number = None
     detected_anomaly = None
     
     if Body:
-        # 1a. Try Gemini Analysis first if API key is configured
+        # 2a. Try Gemini Analysis first if API key is configured
         gemini_result = None
         if os.getenv("GEMINI_API_KEY"):
             logger.info("GEMINI_API_KEY found. Analyzing message using Gemini intermediate intelligence layer...")
@@ -510,7 +689,7 @@ async def webhook_whatsapp(
             client_number = gemini_result.get("client_phone")
             detected_anomaly = gemini_result.get("detected_anomaly")
         else:
-            # 1b. Rule-based Fallback (Regex + keywords)
+            # 2b. Rule-based Fallback (Regex + keywords)
             # Extract potential phone number
             phone_matches = re.findall(r'(\+?[0-9][0-9\s\-\.]{7,15}[0-9])', Body)
             temp_body = Body
@@ -540,7 +719,7 @@ async def webhook_whatsapp(
             
     logger.info(f"Extracted and sanitized folder target name: '{license_plate}', is_devis: {is_devis}, client_number: {client_number}, detected_anomaly: '{detected_anomaly}'")
     
-    # 2. Safety check: Ensure media URL actually exists
+    # Safety check for photo: Ensure media URL actually exists
     if not MediaUrl0:
         logger.warning(f"No media attached to request by {From or 'unknown'}. Rejecting transaction.")
         return build_twiml_response(
@@ -569,7 +748,7 @@ async def webhook_whatsapp(
         filename = now_swiss.strftime("photo_%Y%m%d_%H%M%S.jpg")
         
         # 8. Upload direct to Google Drive folder
-        upload_file_to_folder(drive_service, folder_id, file_bytes, filename)
+        upload_file_to_folder(drive_service, folder_id, file_bytes, filename, mimetype="image/jpeg")
         
         # 8b. If it was a devis/budget request, send interactive validation message to client
         validation_sent = False

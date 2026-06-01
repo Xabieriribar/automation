@@ -333,7 +333,7 @@ def analyze_mechanic_message_with_gemini(text: str) -> Optional[dict]:
         logger.warning("GEMINI_API_KEY is not configured in .env. Skipping Gemini AI analysis.")
         return None
         
-    model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     
     prompt = f"""

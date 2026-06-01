@@ -34,7 +34,7 @@ load_dotenv()
 app = FastAPI(
     title="Garage Twilio-Google Drive Webhook",
     description="Middleware connecting Twilio WhatsApp to Google Drive and Gemini AI services",
-    version="1.3.0"
+    version="1.4.0"
 )
 
 # Enable CORS for Chrome Extension requests
@@ -418,7 +418,7 @@ def transcribe_and_summarize_audio_with_gemini(audio_bytes: bytes, mime_type: st
         return None
         
     model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key=api_key"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     
     # Base64 encode the audio binary payload
     base64_audio = base64.b64encode(audio_bytes).decode("utf-8")
@@ -473,7 +473,7 @@ def analyze_delivery_note_with_gemini(image_bytes: bytes, mime_type: str) -> Opt
         return None
         
     model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key=api_key"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     
     # Base64 encode the image payload
     base64_image = base64.b64encode(image_bytes).decode("utf-8")
@@ -523,6 +523,8 @@ def generate_devis_with_gemini(webpage_text: str, margin_percentage: float) -> O
     """
     Calls the Google Gemini API to analyze raw parts catalog cart text, extract articles,
     apply a sales markup, and generate a professional Swiss repair estimate (devis) in French.
+    Includes regional specifications for the Vaud/Lausanne automotive market (VAT 8.1%,
+    CO Art. 375 alignment, chronological groupings, and automated service fees).
     """
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -533,23 +535,43 @@ def generate_devis_with_gemini(webpage_text: str, margin_percentage: float) -> O
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     
     prompt = f"""
-    Tu es un secrétaire d'atelier automobile expert en Suisse. Tu reçois le texte brut extrait d'une page de panier d'achat de pièces de rechange (contenant des noms de pièces, des prix bruts B2B ou B2C, des quantités, etc.).
+    Tu es un secrétaire d'atelier automobile d'élite dans le canton de Vaud (région de Lausanne, Suisse). Tu reçois le texte brut extrait d'une page de panier d'achat de pièces de rechange (Derendinger, Technomag, Oscaro, etc.).
     
-    Ton travail est de :
-    1. Nettoyer et extraire la liste des pièces détachées (nom, quantité, prix d'origine).
-    2. Calculer le nouveau prix de vente client en appliquant une marge bénéficiaire de {margin_percentage}% sur le prix de chaque pièce.
-    3. Présenter un devis professionnel suisse rédigé en français et structuré comme suit :
-       - Un en-tête professionnel de garage ("DEVIS DE RÉPARATION AUTOMOBILE").
-       - Le nom du Fournisseur identifié (ex: Derendinger, Technomag, Oscaro, etc.).
-       - La liste claire des pièces avec leur prix unitaire calculé (prix avec marge appliquée) et le total par ligne de pièces.
-       - Le total brut HT (Hors Taxes).
-       - Le calcul de la TVA suisse de 8.1% et son montant.
-       - Le montant Total TTC (Toutes Taxes Comprises) en CHF.
+    Ton travail est de générer un Devis de réparation automobile suisse professionnel en français, d'une rigueur absolue.
+    
+    Taux horaire de main-d'œuvre du garage à appliquer : 170 CHF HT / heure.
+    
+    Règles strictes de construction du Devis :
+    
+    1. REGROUPEMENT CHRONOLOGIQUE (Méthode Sandwich) :
+       - Identifie les pièces du panier.
+       - Pour chaque groupe de pièces cohérent (ex: Freins avant, Amortisseurs, Vidange/Filtres, etc.), crée une section dédiée.
+       - Au début de cette section, estime de manière réaliste et ajoute la main-d'œuvre correspondante en heures décimales (ex: "Main-d'œuvre - Remplacement des freins avant : 1.2 h à 170 CHF HT/h = 204.00 CHF HT").
+       - Juste en dessous de cette ligne de main-d'œuvre, liste les pièces associées trouvées dans le panier d'achat, en leur appliquant une marge bénéficiaire de {margin_percentage}% sur le prix brut HT du panier.
+       
+    2. FRAIS AUTOMATISÉS (Frais Annexes et Consommables) :
+       Ajoute systématiquement en fin de devis une section "Frais Annexes et Consommables" comprenant :
+       - "Petites fournitures" : Forfait de 15.00 CHF HT.
+       - "Contribution recyclage et élimination des déchets" : Forfait de 12.00 CHF HT (si des freins, disques, amortisseurs, filtres, huiles ou liquides sont inclus dans les travaux).
+       
+    3. RÉSUMÉ FINANCIER DÉTAILLÉ :
+       Calcule et affiche clairement la synthèse financière à la fin (en CHF) :
+       - Total Main-d'œuvre HT
+       - Total Pièces HT
+       - Total Frais Annexes HT
+       - TOTAL BRUT HT
+       - Montant TVA (exactement 8.1% du TOTAL BRUT HT)
+       - TOTAL À PAYER (TTC) (Somme du TOTAL BRUT HT + Montant TVA)
+       
+    4. MENTIONS LÉGALES OBLIGATOIRES (Vaud/Lausanne) :
+       Ajoute la section suivante en pied de page :
+       "Conditions et Mentions Légales :
+       Ce devis est valable pour une durée de 30 jours à compter de sa date d'émission. Conformément à l'Article 375 du Code des Obligations Suisse (CO), une tolérance empirique de 10% sur le montant total estimé hors taxes est admise en cas de travaux supplémentaires imprévus nécessaires à la sécurité du véhicule."
        
     Texte brut extrait du panier d'achat :
     "{webpage_text}"
     
-    Retourne UNIQUEMENT le texte propre et rédigé du Devis, prêt à être envoyé ou imprimé pour le client. Sois très rigoureux sur les calculs mathématiques et la présentation.
+    Retourne uniquement le texte clair, propre et rédigé du Devis, structuré avec soin, sans aucun formatage Markdown additionnel. Les calculs mathématiques doivent être impeccables.
     """
     
     headers = {"Content-Type": "application/json"}
@@ -564,12 +586,12 @@ def generate_devis_with_gemini(webpage_text: str, margin_percentage: float) -> O
     }
     
     try:
-        logger.info(f"Calling Gemini API ({model}) to generate repair estimate (devis)...")
+        logger.info(f"Calling Gemini API ({model}) to generate legal Swiss devis...")
         response = requests.post(url, headers=headers, json=payload, timeout=25)
         if response.status_code == 200:
             result = response.json()
             text_response = result['candidates'][0]['content']['parts'][0]['text']
-            logger.info("Gemini successfully generated the professional devis.")
+            logger.info("Gemini successfully generated the Vaudois/Swiss legal devis.")
             return text_response.strip()
         else:
             logger.error(f"Gemini API returned error for devis generation: {response.status_code}. Response: {response.text}")

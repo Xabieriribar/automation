@@ -724,8 +724,7 @@ def create_devis_pdf(devis_text: str, plate: str) -> bytes:
         elif line_stripped.startswith("-") or line_stripped.startswith("*"):
             cleaned_item = re.sub(r'^[-*\s]+', '', line_stripped)
             pdf.set_font('helvetica', '', 9.5)
-            pdf.cell(5, 5, chr(149), ln=False, align='C') # elegant listing dot
-            pdf.multi_cell(0, 5, cleaned_item)
+            pdf.multi_cell(0, 5, f"  - {cleaned_item}")
             pdf.set_font('helvetica', '', 10)
         elif any(total_kw in line_stripped.upper() for total_kw in ["TOTAL", "TVA", "À PAYER"]):
             pdf.ln(2)

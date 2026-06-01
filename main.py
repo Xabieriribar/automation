@@ -665,6 +665,9 @@ def create_devis_pdf(devis_text: str, plate: str) -> bytes:
     Parses the generated Gemini estimate text and produces a high-fidelity, beautifully styled PDF.
     Guarantees robust horizontal pointer mapping for the fpdf2 library.
     """
+    # Sanitize characters outside the latin-1 encoding range of Helvetica core font
+    sanitized_text = devis_text.replace("œ", "oe").replace("Œ", "Oe").replace("’", "'").replace("…", "...")
+    
     pdf = SwissDevisPDF()
     pdf.set_auto_page_break(auto=True, margin=35)
     pdf.add_page()
@@ -704,7 +707,7 @@ def create_devis_pdf(devis_text: str, plate: str) -> bytes:
     pdf.set_text_color(15, 23, 42) # Slate 900
     
     # Parse devis lines
-    for line in devis_text.split('\n'):
+    for line in sanitized_text.split('\n'):
         line_stripped = line.strip()
         if not line_stripped:
             pdf.ln(3)

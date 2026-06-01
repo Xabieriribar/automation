@@ -32,7 +32,7 @@ load_dotenv()
 app = FastAPI(
     title="Garage Twilio-Google Drive Webhook",
     description="Middleware connecting Twilio WhatsApp to Google Drive and Gemini AI services",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 # Optional: Add CORS support just in case
@@ -233,7 +233,7 @@ def build_twiml_response(message: str) -> Response:
     return Response(content=xml_content, media_type="application/xml")
 
 # =====================================================================
-# --- Features: Validation Client & La Dictée Atelier (Gemini AI) ---
+# --- Features: Gemini AI & Twilio Integrations ---
 # =====================================================================
 
 try:
@@ -361,7 +361,7 @@ def analyze_mechanic_message_with_gemini(text: str) -> Optional[dict]:
     Analyse ce texte pour remplir l'objet JSON ci-dessous.
     Règles d'analyse :
     1. "is_validation_request" (boolean) : Doit être true si le message indique la détection d'une anomalie, d'une pièce usée, d'un problème sur le véhicule, d'un devis ou d'un budget qui nécessite de demander l'accord/la validation du client pour effectuer des travaux supplémentaires. Par exemple, si le mécanicien mentionne des plaquettes de frein usées, une fuite, ou écrit des mots comme "devis", "budget", "à changer", "à réparer".
-    2. "license_plate" (string) : Extrais la plaque d'immatriculation suisse ou française (ex: "VD 123456", "GE 987654", "AA-123-AA"). Nettoie-la (en majuscules, espaces normaux). Si aucune plaque n'est détectable, laisse une chaîne vide "".
+    2. "license_plate" (string) : Extrais la plaque d'immatriculation suisse ou française (ex: "VD 123456", "GE 987654", "AA-123-AA"). Nettoie-la (en majuscules, espaces nomades). Si aucune plaque n'est détectable, laisse une chaîne vide "".
     3. "client_phone" (string ou null) : Si un numéro de téléphone mobile (suisse ou international, ex: 0791234567, +4179...) est présent dans le texte pour désigner le client, extrais-le. Sinon, retourne null.
     4. "detected_anomaly" (string ou null) : Résume brièvement en français la pièce ou le problème à l'origine de la demande (ex: "plaquettes de frein usées", "pneu arrière lisse", "fuite de liquide de refroidissement"). Max 4-5 mots. Si aucun problème n'est identifiable, retourne null.
 
@@ -394,7 +394,6 @@ def analyze_mechanic_message_with_gemini(text: str) -> Optional[dict]:
         response = requests.post(url, headers=headers, json=payload, timeout=12)
         if response.status_code == 200:
             result = response.json()
-            # Extract text response from Gemini structure
             text_response = result['candidates'][0]['content']['parts'][0]['text']
             parsed_data = json.loads(text_response.strip())
             logger.info(f"Gemini AI successfully parsed structured data: {parsed_data}")
@@ -417,7 +416,6 @@ def transcribe_and_summarize_audio_with_gemini(audio_bytes: bytes, mime_type: st
         return None
         
     model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-    # For multimodal audio payloads, we use the active Gemini model
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     
     # Base64 encode the audio binary payload
@@ -460,6 +458,63 @@ def transcribe_and_summarize_audio_with_gemini(audio_bytes: bytes, mime_type: st
             return None
     except Exception as e:
         logger.error(f"Failed to transcribe workshop audio via Gemini: {e}")
+        return None
+
+def analyze_delivery_note_with_gemini(image_bytes: bytes, mime_type: str) -> Optional[str]:
+    """
+    Calls the Google Gemini API using direct REST multimodal capabilities (inlineData) to analyze
+    and structure a delivery note or parts purchase invoice image in French.
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        logger.error("GEMINI_API_KEY is not configured in .env. Cannot process delivery note.")
+        return None
+        
+    model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    
+    # Base64 encode the image payload
+    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+    
+    prompt = (
+        "Tu es un assistant administratif d'atelier automobile en Suisse. Analyse cette image qui est un bon de livraison ou une facture de pièces de rechange. "
+        "Extrais les informations suivantes avec une précision absolue et formate-les proprement en français :\n"
+        "- 'Fournisseur' : Nom de l'entreprise qui vend les pièces (ex: Derendinger, Technomag, etc.).\n"
+        "- 'Détails des pièces' : Liste claire des articles/pièces commandés avec les quantités si visibles.\n"
+        "- 'Montant Total' : Prix total en CHF (si affiché, sinon mentionne 'Non spécifié').\n"
+        "- 'Plaque associée' : La plaque d'immatriculation suisse concernée (ex: VD 123456)."
+    )
+    
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inlineData": {
+                            "mimeType": mime_type,
+                            "data": base64_image
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+    
+    try:
+        logger.info(f"Sending delivery note image ({len(image_bytes)} bytes) directly to Gemini API ({model}) for vision analysis...")
+        response = requests.post(url, headers=headers, json=payload, timeout=40)
+        if response.status_code == 200:
+            result = response.json()
+            text_response = result['candidates'][0]['content']['parts'][0]['text']
+            logger.info("Gemini vision analysis succeeded for delivery note.")
+            return text_response.strip()
+        else:
+            logger.error(f"Gemini API returned error for vision analysis: {response.status_code}. Response: {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Failed to analyze delivery note with Gemini: {e}")
         return None
 
 def send_validation_buttons(client_number: str, plate: str, from_number: str, detected_anomaly: Optional[str] = None) -> bool:
@@ -554,8 +609,9 @@ async def webhook_whatsapp(
     """
     Twilio Webhook endpoint. Handles incoming WhatsApp media messages and client interactive button responses.
     Features:
-    1. "La Dictée Atelier" - Direct multimodal audio transcribing and structured documentation into Drive.
-    2. "Validation Client Instantanée" - AI-based message parser, folder resolve, and budget validation buttons.
+    1. "La Dictée Atelier" - Direct voice-to-text transcribing and structured documentation into Drive.
+    2. "La Capture des Bons de Livraison" - Direct delivery note/invoice image processing via Gemini Vision.
+    3. "Validation Client Instantanée" - AI-based photo upload and instant validation buttons.
     """
     logger.info(f"Incoming request from {From or 'Unknown Sender'} to {To or 'Unknown Recipient'}. Body: '{Body or ''}', MediaContentType0: '{MediaContentType0 or ''}'")
     
@@ -600,6 +656,14 @@ async def webhook_whatsapp(
         else:
             logger.warning(f"Received client response '{client_response}' from {From} but no pending session found.")
             return build_twiml_response("Merci pour votre réponse. Aucune demande en attente n'a été trouvée pour ce numéro.")
+
+    # Detect delivery note trigger keywords in Body text
+    is_bon_livraison = False
+    if MediaContentType0 and MediaContentType0.startswith("image/"):
+        if Body:
+            body_lower = Body.lower()
+            if any(kw in body_lower for kw in ["bon", "livraison", "facture", "achat"]):
+                is_bon_livraison = True
 
     # 1. Feature: "La Dictée Atelier" (Voice-to-Text Workshop Transcription)
     if MediaContentType0 and MediaContentType0.startswith("audio/"):
@@ -669,124 +733,210 @@ async def webhook_whatsapp(
             logger.exception("An error occurred during 'La Dictée Atelier' processing:")
             return build_twiml_response("❌ Erreur: Échec du traitement de la note vocale d'atelier.")
 
-    # 2. Workflow: Photo Upload & Instant Client Validation
-    # Extract and sanitize the plate string (Caption)
-    license_plate = "A_TRAITER_SANS_PLAQUE"
-    is_devis = False
-    client_number = None
-    detected_anomaly = None
-    
-    if Body:
-        # 2a. Try Gemini Analysis first if API key is configured
-        gemini_result = None
-        if os.getenv("GEMINI_API_KEY"):
-            logger.info("GEMINI_API_KEY found. Analyzing message using Gemini intermediate intelligence layer...")
-            gemini_result = analyze_mechanic_message_with_gemini(Body)
+    # 2. Feature: "La Capture des Bons de Livraison" (Delivery Notes & Parts Capture)
+    elif MediaContentType0 and MediaContentType0.startswith("image/") and is_bon_livraison:
+        logger.info("Delivery note image detected! Starting 'La Capture des Bons de Livraison' workflow.")
+        
+        if not MediaUrl0:
+            logger.warning("Delivery note image type detected but no media URL is present. Rejecting request.")
+            return build_twiml_response("❌ Erreur: Image du bon de livraison introuvable.")
             
-        if gemini_result:
-            is_devis = gemini_result.get("is_validation_request", False)
-            license_plate = gemini_result.get("license_plate", "A_TRAITER_SANS_PLAQUE") or "A_TRAITER_SANS_PLAQUE"
-            client_number = gemini_result.get("client_phone")
-            detected_anomaly = gemini_result.get("detected_anomaly")
-        else:
-            # 2b. Rule-based Fallback (Regex + keywords)
-            # Extract potential phone number
-            phone_matches = re.findall(r'(\+?[0-9][0-9\s\-\.]{7,15}[0-9])', Body)
-            temp_body = Body
-            for match in phone_matches:
-                # Clean and validate if it looks like a phone number
-                cleaned_phone = re.sub(r'[\s\-\.]', '', match)
-                if len(cleaned_phone) >= 9 and len(cleaned_phone) <= 15 and (cleaned_phone.startswith('+') or cleaned_phone.startswith('0')):
-                    client_number = cleaned_phone
-                    # Remove this phone number from the plate string
-                    temp_body = temp_body.replace(match, "")
-                    break
-                    
-            # Detect and clean keywords "devis" or "budget"
-            body_lower = temp_body.lower()
-            if "devis" in body_lower or "budget" in body_lower:
-                is_devis = True
-                for kw in ["devis", "budget"]:
-                    # Case-insensitive replacement
-                    pattern = re.compile(re.escape(kw), re.IGNORECASE)
-                    temp_body = pattern.sub("", temp_body)
-                    
-            # Clean remaining characters as the license plate
-            temp_plate = temp_body.strip()
-            temp_plate = " ".join(temp_plate.split()).upper()
-            if temp_plate:
-                license_plate = temp_plate
+        try:
+            # Download delivery note image from Twilio CDN
+            file_bytes = download_twilio_media(MediaUrl0)
             
-    logger.info(f"Extracted and sanitized folder target name: '{license_plate}', is_devis: {is_devis}, client_number: {client_number}, detected_anomaly: '{detected_anomaly}'")
-    
-    # Safety check for photo: Ensure media URL actually exists
-    if not MediaUrl0:
-        logger.warning(f"No media attached to request by {From or 'unknown'}. Rejecting transaction.")
-        return build_twiml_response(
-            "❌ Erreur: Aucune photo détectée. Veuillez envoyer une photo avec le numéro de plaque en description."
-        )
-        
-    try:
-        # 3. Retrieve configurations
-        parent_folder_id = os.getenv("GOOGLE_DRIVE_PARENT_FOLDER_ID")
-        if not parent_folder_id:
-            logger.critical("GOOGLE_DRIVE_PARENT_FOLDER_ID is not configured in .env file.")
-            raise ValueError("GOOGLE_DRIVE_PARENT_FOLDER_ID environment variable is missing.")
+            # Save temporarily to /tmp/delivery_note.jpg as required by prompt
+            os.makedirs("/tmp", exist_ok=True)
+            image_path = "/tmp/delivery_note.jpg"
+            with open(image_path, "wb") as f:
+                f.write(file_bytes)
+            logger.info(f"Successfully saved delivery note image temporarily to: {image_path}")
             
-        # 4. Get authenticated drive service
-        drive_service = get_drive_service()
-        
-        # 5. Resolve folder path (create or fetch matching subfolder)
-        folder_id = get_or_create_subfolder(drive_service, parent_folder_id, license_plate)
-        
-        # 6. Stream and download image from Twilio's CDN
-        file_bytes = download_twilio_media(MediaUrl0)
-        
-        # 7. Generate beautiful localized Swiss time timestamp for naming
-        swiss_tz = pytz.timezone("Europe/Zurich")
-        now_swiss = datetime.now(swiss_tz)
-        filename = now_swiss.strftime("photo_%Y%m%d_%H%M%S.jpg")
-        
-        # 8. Upload direct to Google Drive folder
-        upload_file_to_folder(drive_service, folder_id, file_bytes, filename, mimetype="image/jpeg")
-        
-        # 8b. If it was a devis/budget request, send interactive validation message to client
-        validation_sent = False
-        if is_devis and From:
-            target_client_number = client_number or os.getenv("DEBUG_CLIENT_NUMBER")
-            if target_client_number:
-                formatted_client = format_to_e164(target_client_number)
-                client_key = formatted_client if formatted_client.startswith("whatsapp:") else f"whatsapp:{formatted_client}"
+            # Process with Google Gemini multimodal capabilities (vision)
+            logger.info("Analyzing delivery note image via Gemini Vision...")
+            extraction = analyze_delivery_note_with_gemini(file_bytes, MediaContentType0)
+            
+            if not extraction:
+                logger.error("Failed to analyze delivery note via Gemini Vision.")
+                return build_twiml_response("❌ Erreur: Impossible d'analyser le bon de livraison.")
                 
-                # Store in session (both From and To numbers are tracked to handle reply)
-                PENDING_VALIDATIONS[client_key] = {
-                    "plate": license_plate,
-                    "garage_number": From
-                }
+            logger.info(f"Gemini Vision extraction results:\n{extraction}")
+            
+            # Extract Swiss license plate from Gemini output or message body
+            plate = extract_swiss_plate(extraction)
+            if not plate and Body:
+                plate = extract_swiss_plate(Body)
+            if not plate:
+                plate = "A_TRAITER_SANS_PLAQUE"
                 
-                logger.info(f"Triggering instant customer validation for {client_key} on plate {license_plate} (anomaly: '{detected_anomaly}')")
-                # We send from the same Twilio number (To parameter of current request)
-                validation_sent = send_validation_buttons(
-                    client_number=formatted_client,
-                    plate=license_plate,
-                    from_number=To or os.environ.get("TWILIO_NUMBER", ""),
-                    detected_anomaly=detected_anomaly
-                )
+            logger.info(f"Resolved license plate for delivery note: '{plate}'")
+            
+            # Get authenticated Google Drive client
+            drive_service = get_drive_service()
+            
+            parent_folder_id = os.getenv("GOOGLE_DRIVE_PARENT_FOLDER_ID")
+            if not parent_folder_id:
+                logger.critical("GOOGLE_DRIVE_PARENT_FOLDER_ID is missing from .env configuration.")
+                raise ValueError("GOOGLE_DRIVE_PARENT_FOLDER_ID variable is missing.")
+                
+            # Create or resolve Google Drive subfolder for the vehicle
+            folder_id = get_or_create_subfolder(drive_service, parent_folder_id, plate)
+            
+            # Generate local timestamp for Switzerland
+            swiss_tz = pytz.timezone("Europe/Zurich")
+            now_swiss = datetime.now(swiss_tz)
+            timestamp = now_swiss.strftime("%Y%m%d_%H%M%S")
+            
+            image_filename = f"bon_livraison_{timestamp}.jpg"
+            text_filename = f"pieces_fournisseur_{timestamp}.txt"
+            
+            # 1. Upload original delivery note image file to Drive
+            upload_file_to_folder(
+                drive_service=drive_service,
+                folder_id=folder_id,
+                file_content=file_bytes,
+                filename=image_filename,
+                mimetype="image/jpeg"
+            )
+            
+            # 2. Upload structured summary text file to Drive
+            text_content_bytes = extraction.encode("utf-8")
+            upload_file_to_folder(
+                drive_service=drive_service,
+                folder_id=folder_id,
+                file_content=text_content_bytes,
+                filename=text_filename,
+                mimetype="text/plain"
+            )
+            
+            logger.info(f"Delivery note and parts summary uploaded successfully to folder '{plate}' on Google Drive.")
+            
+            # Send French WhatsApp confirmation back to the mechanic
+            return build_twiml_response(f"🧾 Bon de livraison et récapitulatif des pièces enregistrés avec succès dans le dossier {plate}.")
+            
+        except Exception as e:
+            logger.exception("An error occurred during 'La Capture des Bons de Livraison' processing:")
+            return build_twiml_response("❌ Erreur: Échec du traitement de la capture du bon de livraison.")
+
+    # 3. Workflow: Photo Upload & Instant Client Validation (Standard Photo/Validation Workflow)
+    else:
+        # Extract and sanitize the plate string (Caption)
+        license_plate = "A_TRAITER_SANS_PLAQUE"
+        is_devis = False
+        client_number = None
+        detected_anomaly = None
         
-        # 9. Return beautiful, compliant TwiML XML to confirm
-        logger.info(f"Transaction successfully processed for '{license_plate}'. Returning Twilio success response.")
-        if is_devis:
-            if validation_sent:
-                return build_twiml_response(f"✅ Photo enregistrée et demande de validation envoyée au client pour le véhicule {license_plate}.")
+        if Body:
+            # 3a. Try Gemini Analysis first if API key is configured
+            gemini_result = None
+            if os.getenv("GEMINI_API_KEY"):
+                logger.info("GEMINI_API_KEY found. Analyzing message using Gemini intermediate intelligence layer...")
+                gemini_result = analyze_mechanic_message_with_gemini(Body)
+                
+            if gemini_result:
+                is_devis = gemini_result.get("is_validation_request", False)
+                license_plate = gemini_result.get("license_plate", "A_TRAITER_SANS_PLAQUE") or "A_TRAITER_SANS_PLAQUE"
+                client_number = gemini_result.get("client_phone")
+                detected_anomaly = gemini_result.get("detected_anomaly")
             else:
-                return build_twiml_response(f"✅ Photo enregistrée pour le véhicule {license_plate}, mais l'envoi de la validation client a échoué (vérifiez le numéro client et la configuration).")
+                # 3b. Rule-based Fallback (Regex + keywords)
+                # Extract potential phone number
+                phone_matches = re.findall(r'(\+?[0-9][0-9\s\-\.]{7,15}[0-9])', Body)
+                temp_body = Body
+                for match in phone_matches:
+                    # Clean and validate if it looks like a phone number
+                    cleaned_phone = re.sub(r'[\s\-\.]', '', match)
+                    if len(cleaned_phone) >= 9 and len(cleaned_phone) <= 15 and (cleaned_phone.startswith('+') or cleaned_phone.startswith('0')):
+                        client_number = cleaned_phone
+                        # Remove this phone number from the plate string
+                        temp_body = temp_body.replace(match, "")
+                        break
+                        
+                # Detect and clean keywords "devis" or "budget"
+                body_lower = temp_body.lower()
+                if "devis" in body_lower or "budget" in body_lower:
+                    is_devis = True
+                    for kw in ["devis", "budget"]:
+                        # Case-insensitive replacement
+                        pattern = re.compile(re.escape(kw), re.IGNORECASE)
+                        temp_body = pattern.sub("", temp_body)
+                        
+                # Clean remaining characters as the license plate
+                temp_plate = temp_body.strip()
+                temp_plate = " ".join(temp_plate.split()).upper()
+                if temp_plate:
+                    license_plate = temp_plate
                 
-        return build_twiml_response(f"✅ Photo enregistrée dans le dossier {license_plate}")
+        logger.info(f"Extracted and sanitized folder target name: '{license_plate}', is_devis: {is_devis}, client_number: {client_number}, detected_anomaly: '{detected_anomaly}'")
         
-    except Exception as e:
-        logger.exception("An unhandled exception occurred during the media synchronization process:")
-        # Always reply with an automated error notice to the mechanic
-        return build_twiml_response("❌ Erreur: Impossible d'enregistrer la photo. Réessayez.")
+        # Safety check for photo: Ensure media URL actually exists
+        if not MediaUrl0:
+            logger.warning(f"No media attached to request by {From or 'unknown'}. Rejecting transaction.")
+            return build_twiml_response(
+                "❌ Erreur: Aucune photo détectée. Veuillez envoyer une photo avec le numéro de plaque en description."
+            )
+            
+        try:
+            # 3. Retrieve configurations
+            parent_folder_id = os.getenv("GOOGLE_DRIVE_PARENT_FOLDER_ID")
+            if not parent_folder_id:
+                logger.critical("GOOGLE_DRIVE_PARENT_FOLDER_ID is not configured in .env file.")
+                raise ValueError("GOOGLE_DRIVE_PARENT_FOLDER_ID environment variable is missing.")
+                
+            # 4. Get authenticated drive service
+            drive_service = get_drive_service()
+            
+            # 5. Resolve folder path (create or fetch matching subfolder)
+            folder_id = get_or_create_subfolder(drive_service, parent_folder_id, license_plate)
+            
+            # 6. Stream and download image from Twilio's CDN
+            file_bytes = download_twilio_media(MediaUrl0)
+            
+            # 7. Generate beautiful localized Swiss time timestamp for naming
+            swiss_tz = pytz.timezone("Europe/Zurich")
+            now_swiss = datetime.now(swiss_tz)
+            filename = now_swiss.strftime("photo_%Y%m%d_%H%M%S.jpg")
+            
+            # 8. Upload direct to Google Drive folder
+            upload_file_to_folder(drive_service, folder_id, file_bytes, filename, mimetype="image/jpeg")
+            
+            # 8b. If it was a devis/budget request, send interactive validation message to client
+            validation_sent = False
+            if is_devis and From:
+                target_client_number = client_number or os.getenv("DEBUG_CLIENT_NUMBER")
+                if target_client_number:
+                    formatted_client = format_to_e164(target_client_number)
+                    client_key = formatted_client if formatted_client.startswith("whatsapp:") else f"whatsapp:{formatted_client}"
+                    
+                    # Store in session (both From and To numbers are tracked to handle reply)
+                    PENDING_VALIDATIONS[client_key] = {
+                        "plate": license_plate,
+                        "garage_number": From
+                    }
+                    
+                    logger.info(f"Triggering instant customer validation for {client_key} on plate {license_plate} (anomaly: '{detected_anomaly}')")
+                    # We send from the same Twilio number (To parameter of current request)
+                    validation_sent = send_validation_buttons(
+                        client_number=formatted_client,
+                        plate=license_plate,
+                        from_number=To or os.environ.get("TWILIO_NUMBER", ""),
+                        detected_anomaly=detected_anomaly
+                    )
+            
+            # 9. Return beautiful, compliant TwiML XML to confirm
+            logger.info(f"Transaction successfully processed for '{license_plate}'. Returning Twilio success response.")
+            if is_devis:
+                if validation_sent:
+                    return build_twiml_response(f"✅ Photo enregistrée et demande de validation envoyée au client pour le véhicule {license_plate}.")
+                else:
+                    return build_twiml_response(f"✅ Photo enregistrée pour le véhicule {license_plate}, mais l'envoi de la validation client a échoué (vérifiez le numéro client et la configuration).")
+                    
+            return build_twiml_response(f"✅ Photo enregistrée dans le dossier {license_plate}")
+            
+        except Exception as e:
+            logger.exception("An unhandled exception occurred during the media synchronization process:")
+            # Always reply with an automated error notice to the mechanic
+            return build_twiml_response("❌ Erreur: Impossible d'enregistrer la photo. Réessayez.")
 
 if __name__ == "__main__":
     import uvicorn

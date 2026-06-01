@@ -1,5 +1,9 @@
-// Lightweight content script to extract body inner text and send it to popup
-(function() {
-  const pageText = document.body ? document.body.innerText : "";
-  return { text: pageText };
+(() => {
+  // Directly grab all visible text from the page DOM
+  const pageText = document.body.innerText || "";
+  
+  // Return the scraped text payload to the popup context
+  return {
+    text: pageText
+  };
 })();

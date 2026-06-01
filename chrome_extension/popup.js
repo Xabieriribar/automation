@@ -4,16 +4,15 @@ document.addEventListener("DOMContentLoaded", () => {
   const shareBtn = document.getElementById("share-btn");
   const plateInput = document.getElementById("plate");
   const marginSelect = document.getElementById("margin");
-  const backendUrlInput = document.getElementById("backend-url");
   const loader = document.getElementById("loader");
   const resultsContainer = document.getElementById("results");
   const devisTextPre = document.getElementById("devis-text");
 
+  // Production API Gateway (strictly compliant with Web Store security policies)
+  const API_ENDPOINT = "https://automation-dsni.onrender.com/api/generate-devis";
+
   // Load saved configurations from Chrome Storage
-  chrome.storage.local.get(["backendUrl", "licensePlate"], (data) => {
-    if (data.backendUrl) {
-      backendUrlInput.value = data.backendUrl;
-    }
+  chrome.storage.local.get(["licensePlate"], (data) => {
     if (data.licensePlate) {
       plateInput.value = data.licensePlate;
     }
@@ -22,7 +21,6 @@ document.addEventListener("DOMContentLoaded", () => {
   generateBtn.addEventListener("click", async () => {
     const plate = plateInput.value.trim();
     const margin = parseFloat(marginSelect.value);
-    const backendUrl = backendUrlInput.value.trim();
 
     if (!plate) {
       alert("Veuillez saisir la plaque d'immatriculation.");
@@ -30,7 +28,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     // Save inputs in storage
-    chrome.storage.local.set({ backendUrl, licensePlate: plate });
+    chrome.storage.local.set({ licensePlate: plate });
 
     // Reset UI states
     loader.style.display = "flex";
@@ -52,11 +50,11 @@ document.addEventListener("DOMContentLoaded", () => {
 
       const extractedText = results[0]?.result?.text;
       if (!extractedText) {
-        throw new Error("Impossible d'extraire le texte de cet onglet.");
+        throw new Error("Impossible d'extraire le texte de cet onglet. Assurez-vous d'être sur une page web de pièces.");
       }
 
-      // 3. Send extraction payload to the backend
-      const response = await fetch(`${backendUrl}/api/generate-devis`, {
+      // 3. Send extraction payload to the production backend
+      const response = await fetch(API_ENDPOINT, {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
@@ -67,6 +65,15 @@ document.addEventListener("DOMContentLoaded", () => {
           margin_percentage: margin
         })
       });
+
+      // Catch bad gateway / gateway timeout (typical Render cold starts)
+      if (response.status === 502 || response.status === 504) {
+        throw new Error("Le serveur Render se réveille (Cold Start). Veuillez patienter 10 secondes et cliquer de nouveau sur 'Générer'.");
+      }
+
+      if (!response.ok) {
+        throw new Error(`Le serveur a répondu avec une erreur : ${response.status}`);
+      }
 
       const data = await response.json();
 

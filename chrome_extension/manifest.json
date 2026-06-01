@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Garage Devis Automatique",
+  "version": "1.1",
+  "description": "Génère un devis professionnel suisse avec marge bénéficiaire à partir de votre panier de pièces en ligne (Derendinger, Technomag, Oscaro, etc.).",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://automation-dsni.onrender.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "devis-automatique-garage@xabieriribar.ch",
+      "strict_min_version": "109.0"
+    }
+  }
+}

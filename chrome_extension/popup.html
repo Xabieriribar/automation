@@ -129,6 +129,7 @@
       font-size: 13px;
       color: var(--text-muted);
       animation: pulse 1.5s ease-in-out infinite;
+      text-align: center;
     }
 
     .results-container {
@@ -195,11 +196,6 @@
   <h2>Garage Devis Automatique</h2>
   
   <div class="form-group">
-    <label for="backend-url">Adresse du Serveur</label>
-    <input type="text" id="backend-url" value="http://localhost:8000" placeholder="https://garage-api.onrender.com">
-  </div>
-
-  <div class="form-group">
     <label for="plate">Plaque d'immatriculation</label>
     <input type="text" id="plate" placeholder="Ex: VD 123456" required>
   </div>
@@ -221,7 +217,7 @@
 
   <div id="loader" class="loader">
     <div class="spinner"></div>
-    <div class="loader-text">Extraction et génération du Devis par l'IA...</div>
+    <div class="loader-text">Extraction et génération du Devis par l'IA...<br><span style="font-size: 10px; color: #f43f5e;">(L'éveil initial du serveur peut prendre 50s)</span></div>
   </div>
 
   <div id="results" class="results-container">

@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: automation-dsni
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: GEMINI_MODEL
+        value: gemini-3.1-flash-lite
+      - key: GEMINI_API_KEY
+        sync: true
+      - key: TWILIO_ACCOUNT_SID
+        sync: true
+      - key: TWILIO_AUTH_TOKEN
+        sync: true
+      - key: TWILIO_NUMBER
+        sync: true
+      - key: DEBUG_CLIENT_NUMBER
+        sync: true
+      - key: TWILIO_CONTENT_SID
+        sync: true
+      - key: GOOGLE_DRIVE_PARENT_FOLDER_ID
+        sync: true
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: true

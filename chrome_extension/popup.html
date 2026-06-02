@@ -40,6 +40,12 @@
       margin-bottom: 16px;
     }
 
+    .form-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
     label {
       display: block;
       font-size: 12px;
@@ -60,6 +66,10 @@
       font-size: 14px;
       box-sizing: border-box;
       transition: all 0.3s ease;
+    }
+
+    input::placeholder {
+      color: rgba(148, 163, 184, 0.72);
     }
 
     input:focus, select:focus {
@@ -106,6 +116,12 @@
 
     button.btn-secondary:hover {
       background: rgba(255, 255, 255, 0.15);
+    }
+
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+      transform: none;
     }
 
     .loader {
@@ -159,6 +175,60 @@
     .button-group {
       display: flex;
       gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .review-section {
+      margin-bottom: 12px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .review-section h3 {
+      margin: 0 0 8px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #bfdbfe;
+      letter-spacing: 0;
+    }
+
+    .review-list {
+      margin: 0;
+      padding-left: 16px;
+      color: #dbeafe;
+      font-size: 11px;
+      line-height: 1.45;
+    }
+
+    .review-list li + li {
+      margin-top: 4px;
+    }
+
+    .totals-grid {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 6px 12px;
+      font-size: 11px;
+      color: #dbeafe;
+    }
+
+    .totals-grid .amount {
+      font-weight: 700;
+      color: #f8fafc;
+      text-align: right;
+    }
+
+    .warnings-box {
+      display: none;
+      margin-bottom: 12px;
+      padding: 10px;
+      background: rgba(245, 158, 11, 0.14);
+      border: 1px solid rgba(245, 158, 11, 0.36);
+      border-radius: 6px;
+      color: #fde68a;
+      font-size: 11px;
+      line-height: 1.45;
     }
 
     pre {
@@ -201,6 +271,45 @@
   </div>
 
   <div class="form-group">
+    <label for="client-name">Client</label>
+    <input type="text" id="client-name" placeholder="Nom du client (optionnel)">
+  </div>
+
+  <div class="form-group">
+    <label for="vehicle-label">Véhicule</label>
+    <input type="text" id="vehicle-label" placeholder="Ex: VW Golf 1.4 TSI (optionnel)">
+  </div>
+
+  <div class="form-group">
+    <label for="operation-type">Opération</label>
+    <input type="text" id="operation-type" placeholder="Travaux atelier">
+  </div>
+
+  <div class="form-row">
+    <div class="form-group">
+      <label for="labor-hours">Heures MO</label>
+      <input type="number" id="labor-hours" min="0" step="0.1" placeholder="Optionnel">
+    </div>
+
+    <div class="form-group">
+      <label for="hourly-rate">Taux CHF/h</label>
+      <input type="number" id="hourly-rate" min="0" step="1" placeholder="145">
+    </div>
+  </div>
+
+  <div class="form-row">
+    <div class="form-group">
+      <label for="fee-label">Frais</label>
+      <input type="text" id="fee-label" placeholder="Ex: recyclage">
+    </div>
+
+    <div class="form-group">
+      <label for="fee-amount">Frais CHF HT</label>
+      <input type="number" id="fee-amount" min="0" step="0.05" placeholder="Optionnel">
+    </div>
+  </div>
+
+  <div class="form-group">
     <label for="margin">Marge bénéficiaire (%)</label>
     <select id="margin">
       <option value="10">10%</option>
@@ -213,6 +322,18 @@
     </select>
   </div>
 
+  <div class="form-group">
+    <label for="export-target">Export cible</label>
+    <select id="export-target">
+      <option value="text" selected>Texte + CSV + PDF</option>
+      <option value="csv">CSV</option>
+      <option value="pdf">PDF</option>
+      <option value="bexio_draft">bexio draft dry-run</option>
+      <option value="winbiz_import">Winbiz import</option>
+      <option value="cresus_import">Crésus import</option>
+    </select>
+  </div>
+
   <button id="generate-btn" class="btn-primary">Générer le Devis</button>
 
   <div id="loader" class="loader">
@@ -222,12 +343,23 @@
 
   <div id="results" class="results-container">
     <div class="results-header">
-      <span class="results-title">📄 Devis Généré</span>
+      <span class="results-title">Devis généré</span>
       <div class="button-group">
-        <button id="copy-btn" class="btn-secondary">Copier</button>
-        <button id="pdf-btn" class="btn-secondary">Télécharger PDF</button>
+        <button id="copy-btn" class="btn-secondary">Copier texte</button>
+        <button id="copy-csv-btn" class="btn-secondary">Copier CSV</button>
+        <button id="csv-btn" class="btn-secondary">CSV</button>
+        <button id="pdf-btn" class="btn-secondary">PDF</button>
         <button id="share-btn" class="btn-secondary">WhatsApp</button>
       </div>
+    </div>
+    <div id="warnings" class="warnings-box"></div>
+    <div class="review-section">
+      <h3>Lignes générées</h3>
+      <ul id="parts-summary" class="review-list"></ul>
+    </div>
+    <div class="review-section">
+      <h3>Totaux</h3>
+      <div id="totals-summary" class="totals-grid"></div>
     </div>
     <pre id="devis-text"></pre>
   </div>

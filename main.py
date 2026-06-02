@@ -1,13 +1,15 @@
 import os
 import json
 import logging
-from datetime import datetime
-from io import BytesIO
-from typing import Optional
+import csv
+from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
+from io import BytesIO, StringIO
+from typing import Any, Dict, List, Optional, Tuple
 import re
 import base64
 
-from fastapi import FastAPI, Form, Response, status
+from fastapi import FastAPI, Form, Header, Response
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import requests
@@ -18,7 +20,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # PDF Generation library imports
 from fpdf import FPDF
@@ -34,6 +36,19 @@ logger = logging.getLogger("GarageWebhook")
 # Load environment variables
 load_dotenv()
 
+
+def get_configured_gemini_api_key() -> str:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    placeholder_values = {
+        "your_gemini_api_key_here",
+        "YOUR_GEMINI_API_KEY",
+        "your-api-key",
+    }
+    if not api_key or api_key in placeholder_values:
+        return ""
+    return api_key
+
+
 app = FastAPI(
     title="Garage Twilio-Google Drive Webhook",
     description="Middleware connecting Twilio WhatsApp to Google Drive and Gemini AI services",
@@ -44,7 +59,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -350,7 +365,7 @@ def analyze_mechanic_message_with_gemini(text: str) -> Optional[dict]:
     checking if work/budget validation is requested, finding a potential customer phone,
     and summarizing the anomaly/problem detected.
     """
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = get_configured_gemini_api_key()
     if not api_key:
         logger.warning("GEMINI_API_KEY is not configured in .env. Skipping Gemini AI analysis.")
         return None
@@ -415,7 +430,7 @@ def transcribe_and_summarize_audio_with_gemini(audio_bytes: bytes, mime_type: st
     Calls the Google Gemini API using direct REST multimodal capabilities (inlineData) to transcribe
     and format a mechanic's workshop voice memo in French.
     """
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = get_configured_gemini_api_key()
     if not api_key:
         logger.error("GEMINI_API_KEY is not configured in .env. Cannot process audio memo.")
         return None
@@ -470,7 +485,7 @@ def analyze_delivery_note_with_gemini(image_bytes: bytes, mime_type: str) -> Opt
     Calls the Google Gemini API using direct REST multimodal capabilities (inlineData) to analyze
     and structure a delivery note or parts purchase invoice image in French.
     """
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = get_configured_gemini_api_key()
     if not api_key:
         logger.error("GEMINI_API_KEY is not configured in .env. Cannot process delivery note.")
         return None
@@ -529,7 +544,7 @@ def generate_devis_with_gemini(webpage_text: str, margin_percentage: float) -> O
     Includes regional specifications for the Vaud/Lausanne automotive market (VAT 8.1%,
     CO Art. 375 alignment, chronological groupings, and automated service fees).
     """
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = get_configured_gemini_api_key()
     if not api_key:
         logger.error("GEMINI_API_KEY is not configured in .env. Cannot generate devis.")
         return None
@@ -858,95 +873,1132 @@ async def health_check():
 # =====================================================================
 
 class DevisRequest(BaseModel):
-    webpage_text: str
-    license_plate: str
-    margin_percentage: Optional[float] = 20.0
+    webpage_text: str = Field(default="", max_length=100000)
+    license_plate: str = Field(default="", max_length=64)
+    margin_percentage: Optional[float] = Field(default=20.0, ge=0, le=200)
+    client_name: Optional[str] = Field(default=None, max_length=120)
+    vehicle_label: Optional[str] = Field(default=None, max_length=160)
+    operation_type: Optional[str] = Field(default=None, max_length=160)
+    labor_hours: Optional[float] = Field(default=None, ge=0, le=100)
+    hourly_rate: Optional[float] = Field(default=None, ge=0, le=1000)
+    fee_label: Optional[str] = Field(default=None, max_length=120)
+    fee_amount_ht: Optional[float] = Field(default=None, ge=0, le=10000)
+    export_target: str = Field(default="text", max_length=32)
+    bexio_dry_run: bool = True
 
-@app.post("/api/generate-devis", tags=["Devis"])
-async def api_generate_devis(request: DevisRequest):
+
+class PartLine(BaseModel):
+    reference: str = ""
+    description: str
+    quantity: float = 1.0
+    unit_price_ht: float
+    total_ht: float
+    brand: str = ""
+    supplier: str = ""
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class LaborLine(BaseModel):
+    description: str
+    hours: float
+    hourly_rate: float
+    total_ht: float
+
+
+class FeeLine(BaseModel):
+    description: str
+    amount_ht: float
+
+
+class DevisData(BaseModel):
+    devis_number: str
+    date: str
+    client_name: str
+    vehicle_label: str
+    license_plate: str
+    operation_type: str
+    margin_percentage: float
+    parts: List[PartLine]
+    labor: List[LaborLine]
+    fees: List[FeeLine]
+    totals: Dict[str, float]
+    warnings: List[str]
+
+
+class DevisResponse(BaseModel):
+    devis: str
+    csv: str
+    pdf_base64: str
+    plate: str
+    parts: List[PartLine]
+    labor: List[LaborLine]
+    fees: List[FeeLine]
+    totals: Dict[str, float]
+    warnings: List[str]
+    exports: Dict[str, Any]
+
+
+MONEY_QUANT = Decimal("0.01")
+DEFAULT_TVA_RATE = 0.081
+DEFAULT_HOURLY_RATE = 145.0
+DEFAULT_OPERATION_TYPE = "Travaux atelier"
+SUPPORTED_EXPORT_TARGETS = {"text", "csv", "pdf", "bexio_draft", "winbiz_import", "cresus_import"}
+KNOWN_SUPPLIERS = [
+    "Derendinger",
+    "Technomag",
+    "Oscaro",
+    "Autodoc",
+    "ESA",
+    "Mister-Auto",
+    "Krautli",
+    "Auto-Doc",
+]
+KNOWN_BRANDS = [
+    "ATE",
+    "Bosch",
+    "Brembo",
+    "TRW",
+    "Sachs",
+    "Valeo",
+    "Mann",
+    "Mahle",
+    "Meyle",
+    "Febi",
+    "SKF",
+    "NGK",
+    "Denso",
+    "Textar",
+    "Ferodo",
+    "Bilstein",
+]
+PRICE_RE = re.compile(
+    r"(?:CHF|SFR|Fr\.?)\s*([0-9][0-9'’\s]*(?:[,.][0-9]{1,2})?)|"
+    r"([0-9][0-9'’\s]*(?:[,.][0-9]{1,2})?)\s*(?:CHF|SFR|Fr\.?)",
+    re.IGNORECASE,
+)
+REFERENCE_RE = re.compile(r"\b(?=[A-Z0-9][A-Z0-9\-/.]*\d)[A-Z0-9][A-Z0-9\-/.]{4,}\b", re.IGNORECASE)
+NOISE_PRICE_WORDS = (
+    "total",
+    "sous-total",
+    "subtotal",
+    "tva",
+    "vat",
+    "rabais",
+    "remise",
+    "coupon",
+    "livraison",
+    "transport",
+    "expedition",
+    "port",
+    "paiement",
+)
+
+
+def _money(value: Any) -> float:
+    return float(Decimal(str(value or 0)).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP))
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    cleaned = str(value).strip().replace("'", "").replace("’", "").replace(" ", "").replace(",", ".")
+    match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+    if not match:
+        return default
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return default
+
+
+def _clean_label(value: Optional[str], default: str) -> str:
+    if not value:
+        return default
+    cleaned = re.sub(r"\s+", " ", value).strip()
+    return cleaned or default
+
+
+def _format_chf(value: float) -> str:
+    return f"CHF {_money(value):,.2f}".replace(",", "'")
+
+
+def _format_qty(value: float) -> str:
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _detect_supplier(text: str) -> str:
+    lower_text = text.lower()
+    for supplier in KNOWN_SUPPLIERS:
+        if supplier.lower() in lower_text:
+            return supplier
+    return ""
+
+
+def _parse_money_values(line: str) -> List[float]:
+    if not re.search(r"(CHF|SFR|Fr\.?)", line, flags=re.IGNORECASE):
+        return []
+    values = []
+    for match in PRICE_RE.finditer(line):
+        value = _to_float(match.group(1) or match.group(2), 0.0)
+        if value > 0:
+            values.append(_money(value))
+    return values
+
+
+def _is_noise_price_line(line: str) -> bool:
+    lower_line = line.lower()
+    return any(word in lower_line for word in NOISE_PRICE_WORDS)
+
+
+def _extract_quantity(context: str) -> float:
+    patterns = [
+        r"(?:quantite|quantité|qty|qte|qté)\s*[:x]?\s*([0-9]+(?:[,.][0-9]+)?)",
+        r"\bx\s*([0-9]+(?:[,.][0-9]+)?)\b",
+        r"\b([0-9]+(?:[,.][0-9]+)?)\s*x\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, context, flags=re.IGNORECASE)
+        if match:
+            quantity = _to_float(match.group(1), 1.0)
+            if quantity > 0:
+                return quantity
+    return 1.0
+
+
+def _extract_reference(context: str) -> str:
+    skip_words = {"CHF", "SFR", "TOTAL", "PRIX", "QUANTITE", "QTE", "ARTICLE"}
+    for candidate in REFERENCE_RE.findall(context.upper()):
+        normalized = candidate.strip(".,;:")
+        if normalized in skip_words:
+            continue
+        if re.fullmatch(r"\d+[,.]\d{1,2}", normalized):
+            continue
+        if normalized.isdigit() and len(normalized) < 5:
+            continue
+        return normalized
+    return ""
+
+
+def _extract_brand(context: str) -> str:
+    brand_match = re.search(r"(?:marque|brand)\s*[:\-]?\s*([A-Za-z0-9\-]{2,30})", context, flags=re.IGNORECASE)
+    if brand_match:
+        return _clean_label(brand_match.group(1), "")
+    lower_context = context.lower()
+    for brand in KNOWN_BRANDS:
+        if re.search(rf"\b{re.escape(brand.lower())}\b", lower_context):
+            return brand
+    return ""
+
+
+def _extract_description(context_lines: List[str]) -> str:
+    for raw_line in reversed(context_lines):
+        line = re.sub(r"\s+", " ", raw_line).strip(" -:\t")
+        lower_line = line.lower()
+        if not line or len(line) < 4:
+            continue
+        if _parse_money_values(line) or _is_noise_price_line(line):
+            continue
+        if re.search(r"^(quantite|quantité|qty|qte|qté)\b", lower_line):
+            continue
+        if re.search(r"^(reference|ref\.?|marque|brand)\b", lower_line):
+            continue
+        if lower_line in {"prix", "prix ht", "quantite", "quantité", "qte", "qté", "article", "panier"}:
+            continue
+        if not re.search(r"[A-Za-zÀ-ÿ]", line):
+            continue
+        return line[:140]
+    return "Piece extraite du panier"
+
+
+def _coerce_part_line(raw: Dict[str, Any], supplier: str = "") -> Optional[PartLine]:
+    description = _clean_label(raw.get("description"), "Piece extraite du panier")
+    quantity = _to_float(raw.get("quantity"), 1.0)
+    if quantity <= 0:
+        quantity = 1.0
+    unit_price = _to_float(raw.get("unit_price_ht"), 0.0)
+    total = _to_float(raw.get("total_ht"), 0.0)
+    if unit_price <= 0 and total > 0:
+        unit_price = total / quantity
+    if unit_price <= 0:
+        return None
+    confidence = _to_float(raw.get("confidence"), 0.5)
+    confidence = min(1.0, max(0.0, confidence))
+    return PartLine(
+        reference=_clean_label(raw.get("reference"), ""),
+        description=description,
+        quantity=quantity,
+        unit_price_ht=_money(unit_price),
+        total_ht=_money(unit_price * quantity),
+        brand=_clean_label(raw.get("brand"), ""),
+        supplier=_clean_label(raw.get("supplier"), supplier),
+        confidence=confidence,
+    )
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"```$", "", cleaned).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        return json.loads(cleaned[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def extract_parts_with_gemini(webpage_text: str, supplier: str) -> Tuple[List[PartLine], List[str]]:
+    api_key = get_configured_gemini_api_key()
+    if not api_key:
+        return [], ["Gemini non configure: extraction locale par heuristiques."]
+
+    model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    prompt = f"""
+Tu extrais uniquement des lignes de pieces depuis un texte visible de panier fournisseur automobile.
+Retourne du JSON strict uniquement, sans Markdown, au schema:
+{{
+  "parts": [
+    {{
+      "reference": "string",
+      "description": "string",
+      "quantity": number,
+      "unit_price_ht": number,
+      "total_ht": number,
+      "brand": "string",
+      "supplier": "string",
+      "confidence": number
+    }}
+  ],
+  "warnings": ["string"]
+}}
+
+Regles:
+- N'extrais que les pieces candidates presentes dans le texte.
+- N'ajoute pas de main-d'oeuvre, TVA, marge, frais, conditions ou total final.
+- Les prix doivent etre des nombres CHF HT visibles ou deduits du contexte direct.
+- Ignore les totaux panier, TVA, rabais, livraison, frais de port et moyens de paiement.
+- Si une information manque, utilise une chaine vide et une confiance plus basse.
+
+Texte fournisseur:
+{webpage_text[:12000]}
+"""
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+        },
+    }
+    try:
+        response = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=20)
+        if response.status_code != 200:
+            logger.warning("Gemini extraction failed with HTTP %s.", response.status_code)
+            return [], ["Gemini indisponible: extraction locale par heuristiques."]
+        result = response.json()
+        text_response = result["candidates"][0]["content"]["parts"][0]["text"]
+        data = _extract_json_object(text_response)
+        if not data:
+            return [], ["Gemini a renvoye une reponse non JSON: extraction locale utilisee."]
+        parts = []
+        for raw_part in data.get("parts", []):
+            if isinstance(raw_part, dict):
+                part = _coerce_part_line(raw_part, supplier=supplier)
+                if part:
+                    parts.append(part)
+        warnings = [str(item)[:180] for item in data.get("warnings", []) if item]
+        return parts, warnings
+    except Exception as exc:
+        logger.warning("Gemini extraction failed: %s", exc)
+        return [], ["Gemini indisponible: extraction locale par heuristiques."]
+
+
+def extract_parts_with_fallback(webpage_text: str, supplier: str) -> Tuple[List[PartLine], List[str]]:
+    warnings = []
+    if not webpage_text.strip():
+        return [], ["Aucun texte exploitable n'a ete extrait de l'onglet actif."]
+
+    normalized = webpage_text.replace("\xa0", " ")
+    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    parts: List[PartLine] = []
+    seen = set()
+
+    for index, line in enumerate(lines):
+        prices = _parse_money_values(line)
+        if not prices or _is_noise_price_line(line):
+            continue
+
+        context_lines = lines[max(0, index - 6):index + 1]
+        context = " ".join(context_lines)
+        quantity = _extract_quantity(context)
+        unit_price = min(prices) if len(prices) > 1 else prices[0]
+        description = _extract_description(context_lines[:-1] or context_lines)
+        reference = _extract_reference(context)
+        brand = _extract_brand(context)
+        confidence = 0.62 if description != "Piece extraite du panier" else 0.42
+
+        key = (reference.lower(), description.lower(), quantity, unit_price)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        part = _coerce_part_line(
+            {
+                "reference": reference,
+                "description": description,
+                "quantity": quantity,
+                "unit_price_ht": unit_price,
+                "brand": brand,
+                "supplier": supplier,
+                "confidence": confidence,
+            },
+            supplier=supplier,
+        )
+        if part:
+            parts.append(part)
+
+    if not parts:
+        warnings.append("Aucune piece n'a ete detectee automatiquement. Verifiez que l'onglet actif affiche bien le panier fournisseur.")
+    elif sum(part.confidence for part in parts) / len(parts) < 0.55:
+        warnings.append("Confiance d'extraction faible: controlez les pieces et les prix avant d'envoyer le devis.")
+
+    return parts[:40], warnings
+
+
+def extract_parts_from_text(webpage_text: str) -> Tuple[List[PartLine], List[str]]:
+    supplier = _detect_supplier(webpage_text)
+    warnings: List[str] = []
+    parts: List[PartLine] = []
+
+    if get_configured_gemini_api_key():
+        parts, gemini_warnings = extract_parts_with_gemini(webpage_text, supplier)
+        warnings.extend(gemini_warnings)
+
+    if not parts:
+        fallback_parts, fallback_warnings = extract_parts_with_fallback(webpage_text, supplier)
+        parts = fallback_parts
+        warnings.extend(fallback_warnings)
+
+    if parts and sum(part.confidence for part in parts) / len(parts) < 0.55:
+        warnings.append("Certaines lignes ont une confiance faible: confirmez le resume avant validation client.")
+
+    return parts, list(dict.fromkeys(warnings))
+
+
+def apply_margin_to_parts(parts: List[PartLine], margin_percentage: float) -> List[PartLine]:
+    multiplier = 1 + (margin_percentage / 100.0)
+    priced_parts = []
+    for part in parts:
+        unit_price = _money(part.unit_price_ht * multiplier)
+        priced_parts.append(
+            PartLine(
+                reference=part.reference,
+                description=part.description,
+                quantity=part.quantity,
+                unit_price_ht=unit_price,
+                total_ht=_money(unit_price * part.quantity),
+                brand=part.brand,
+                supplier=part.supplier,
+                confidence=part.confidence,
+            )
+        )
+    return priced_parts
+
+
+def build_devis_data(request: DevisRequest) -> DevisData:
+    swiss_tz = pytz.timezone("Europe/Zurich")
+    now_swiss = datetime.now(swiss_tz)
+    warnings: List[str] = []
+
+    plate = extract_swiss_plate(request.license_plate) or _clean_label(request.license_plate, "A_TRAITER_SANS_PLAQUE").upper()
+    operation_type = _clean_label(request.operation_type, DEFAULT_OPERATION_TYPE)
+    margin_percentage = float(request.margin_percentage if request.margin_percentage is not None else 20.0)
+    if request.export_target not in SUPPORTED_EXPORT_TARGETS:
+        warnings.append(f"Export cible inconnu '{request.export_target}': les exports texte, CSV et PDF restent disponibles.")
+
+    raw_parts, extraction_warnings = extract_parts_from_text(request.webpage_text)
+    warnings.extend(extraction_warnings)
+    parts = apply_margin_to_parts(raw_parts, margin_percentage)
+
+    labor: List[LaborLine] = []
+    labor_hours = float(request.labor_hours or 0)
+    if labor_hours > 0:
+        hourly_rate = float(request.hourly_rate if request.hourly_rate is not None else DEFAULT_HOURLY_RATE)
+        if request.hourly_rate is None:
+            warnings.append(f"Taux horaire absent: le taux par defaut de {_format_chf(DEFAULT_HOURLY_RATE)} HT/h a ete utilise.")
+        labor_total = _money(labor_hours * hourly_rate)
+        labor.append(
+            LaborLine(
+                description=f"Main-d'oeuvre - {operation_type}",
+                hours=_money(labor_hours),
+                hourly_rate=_money(hourly_rate),
+                total_ht=labor_total,
+            )
+        )
+    elif request.hourly_rate:
+        warnings.append("Taux horaire ignore: ajoutez des heures de main-d'oeuvre pour creer une ligne MO.")
+
+    fees: List[FeeLine] = []
+    fee_amount = float(request.fee_amount_ht or 0)
+    if fee_amount > 0:
+        fees.append(
+            FeeLine(
+                description=_clean_label(request.fee_label, "Frais annexes"),
+                amount_ht=_money(fee_amount),
+            )
+        )
+    elif request.fee_label:
+        warnings.append("Libelle de frais ignore: ajoutez un montant HT pour creer une ligne de frais.")
+
+    total_labor_ht = _money(sum(item.total_ht for item in labor))
+    total_parts_ht = _money(sum(item.total_ht for item in parts))
+    total_fees_ht = _money(sum(item.amount_ht for item in fees))
+    total_ht = _money(total_labor_ht + total_parts_ht + total_fees_ht)
+    tva_amount = _money(total_ht * DEFAULT_TVA_RATE)
+    total_ttc = _money(total_ht + tva_amount)
+
+    totals = {
+        "total_labor_ht": total_labor_ht,
+        "total_parts_ht": total_parts_ht,
+        "total_fees_ht": total_fees_ht,
+        "total_ht": total_ht,
+        "tva_rate": DEFAULT_TVA_RATE,
+        "tva_amount": tva_amount,
+        "total_ttc": total_ttc,
+    }
+
+    return DevisData(
+        devis_number=now_swiss.strftime("DEVIS-%Y%m%d-%H%M%S"),
+        date=now_swiss.strftime("%d.%m.%Y"),
+        client_name=_clean_label(request.client_name, "Client a renseigner"),
+        vehicle_label=_clean_label(request.vehicle_label, "Vehicule a preciser"),
+        license_plate=plate,
+        operation_type=operation_type,
+        margin_percentage=_money(margin_percentage),
+        parts=parts,
+        labor=labor,
+        fees=fees,
+        totals=totals,
+        warnings=list(dict.fromkeys(warnings)),
+    )
+
+
+def build_devis_text(data: DevisData) -> str:
+    lines = [
+        "DEVIS DE REPARATION AUTOMOBILE",
+        "",
+        "Garage Automobile de Lausanne",
+        "Adresse: Garage a completer, Canton de Vaud",
+        "IDE/TVA: CHE-XXX.XXX.XXX TVA",
+        "",
+        f"No devis: {data.devis_number}",
+        f"Date: {data.date}",
+        f"Client: {data.client_name}",
+        f"Vehicule: {data.vehicle_label}",
+        f"Plaque: {data.license_plate}",
+        f"Operation: {data.operation_type}",
+        "",
+        "1. Main-d'oeuvre",
+    ]
+    if data.labor:
+        for line in data.labor:
+            lines.append(
+                f"- {line.description}: {_format_qty(line.hours)} h x {_format_chf(line.hourly_rate)} HT/h = {_format_chf(line.total_ht)} HT"
+            )
+    else:
+        lines.append("- Aucune main-d'oeuvre ajoutee.")
+
+    lines.extend(["", "2. Pieces"])
+    if data.parts:
+        lines.append(f"Prix pieces HT avec marge appliquee de {_format_qty(data.margin_percentage)}%.")
+        for part in data.parts:
+            reference = f"Ref. {part.reference} - " if part.reference else ""
+            brand = f" ({part.brand})" if part.brand else ""
+            supplier = f" - {part.supplier}" if part.supplier else ""
+            lines.append(
+                f"- {reference}{part.description}{brand}{supplier}: "
+                f"{_format_qty(part.quantity)} x {_format_chf(part.unit_price_ht)} HT = {_format_chf(part.total_ht)} HT"
+            )
+    else:
+        lines.append("- Aucune piece n'a pu etre extraite automatiquement du panier.")
+
+    lines.extend(["", "3. Frais annexes et consommables"])
+    if data.fees:
+        for fee in data.fees:
+            lines.append(f"- {fee.description}: {_format_chf(fee.amount_ht)} HT")
+    else:
+        lines.append("- Aucun frais annexe ajoute.")
+
+    totals = data.totals
+    lines.extend(
+        [
+            "",
+            "Resume financier",
+            f"- Total main-d'oeuvre HT: {_format_chf(totals['total_labor_ht'])}",
+            f"- Total pieces HT: {_format_chf(totals['total_parts_ht'])}",
+            f"- Total frais HT: {_format_chf(totals['total_fees_ht'])}",
+            f"- Total HT: {_format_chf(totals['total_ht'])}",
+            f"- TVA 8.1%: {_format_chf(totals['tva_amount'])}",
+            f"- Total TTC: {_format_chf(totals['total_ttc'])}",
+            "",
+            "Conditions",
+            "- Devis valable 30 jours a compter de la date d'emission.",
+            "- Tout travail supplementaire depassant 10% du montant HT necessite l'accord du client.",
+            "- Paiement du a la restitution du vehicule.",
+        ]
+    )
+
+    if data.warnings:
+        lines.extend(["", "Points a verifier"])
+        for warning in data.warnings:
+            lines.append(f"- {warning}")
+
+    return "\n".join(lines)
+
+
+def iter_invoice_export_lines(data: DevisData) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    position = 1
+
+    for labor in data.labor:
+        rows.append(
+            {
+                "position": position,
+                "type": "labour",
+                "reference": "",
+                "description": labor.description,
+                "quantity": labor.hours,
+                "unit": "h",
+                "unit_price_ht": labor.hourly_rate,
+                "total_ht": labor.total_ht,
+                "vat_rate": DEFAULT_TVA_RATE,
+            }
+        )
+        position += 1
+
+    for part in data.parts:
+        rows.append(
+            {
+                "position": position,
+                "type": "part",
+                "reference": part.reference,
+                "description": part.description,
+                "quantity": part.quantity,
+                "unit": "pc",
+                "unit_price_ht": part.unit_price_ht,
+                "total_ht": part.total_ht,
+                "vat_rate": DEFAULT_TVA_RATE,
+            }
+        )
+        position += 1
+
+    for fee in data.fees:
+        rows.append(
+            {
+                "position": position,
+                "type": "fee",
+                "reference": "",
+                "description": fee.description,
+                "quantity": 1,
+                "unit": "pc",
+                "unit_price_ht": fee.amount_ht,
+                "total_ht": fee.amount_ht,
+                "vat_rate": DEFAULT_TVA_RATE,
+            }
+        )
+        position += 1
+
+    return rows
+
+
+def build_invoice_csv(data: DevisData) -> str:
+    output = StringIO()
+    fieldnames = [
+        "position",
+        "type",
+        "reference",
+        "description",
+        "quantity",
+        "unit",
+        "unit_price_ht",
+        "total_ht",
+        "vat_rate",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames, delimiter=";", lineterminator="\n")
+    writer.writeheader()
+    for row in iter_invoice_export_lines(data):
+        formatted = dict(row)
+        formatted["quantity"] = _format_qty(float(row["quantity"]))
+        formatted["unit_price_ht"] = f"{_money(row['unit_price_ht']):.2f}"
+        formatted["total_ht"] = f"{_money(row['total_ht']):.2f}"
+        formatted["vat_rate"] = "8.1"
+        writer.writerow(formatted)
+    return output.getvalue()
+
+
+def _env_int(name: str) -> Optional[int]:
+    value = os.getenv(name)
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _env_float(name: str) -> Optional[float]:
+    value = os.getenv(name)
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def build_bexio_draft_payload(data: DevisData) -> Tuple[Dict[str, Any], List[str]]:
+    today = datetime.strptime(data.date, "%d.%m.%Y")
+    missing = []
+    required_ids = {
+        "contact_id": _env_int("BEXIO_CONTACT_ID"),
+        "user_id": _env_int("BEXIO_USER_ID"),
+        "bank_account_id": _env_int("BEXIO_BANK_ACCOUNT_ID"),
+        "currency_id": _env_int("BEXIO_CURRENCY_ID"),
+        "payment_type_id": _env_int("BEXIO_PAYMENT_TYPE_ID"),
+        "language_id": _env_int("BEXIO_LANGUAGE_ID"),
+        "account_id": _env_int("BEXIO_ACCOUNT_ID"),
+        "tax_id": _env_int("BEXIO_TAX_ID"),
+        "unit_id": _env_int("BEXIO_UNIT_ID"),
+    }
+    for env_name, value in {
+        "BEXIO_CONTACT_ID": required_ids["contact_id"],
+        "BEXIO_USER_ID": required_ids["user_id"],
+        "BEXIO_BANK_ACCOUNT_ID": required_ids["bank_account_id"],
+        "BEXIO_CURRENCY_ID": required_ids["currency_id"],
+        "BEXIO_PAYMENT_TYPE_ID": required_ids["payment_type_id"],
+        "BEXIO_LANGUAGE_ID": required_ids["language_id"],
+        "BEXIO_ACCOUNT_ID": required_ids["account_id"],
+        "BEXIO_TAX_ID": required_ids["tax_id"],
+        "BEXIO_UNIT_ID": required_ids["unit_id"],
+    }.items():
+        if value is None:
+            missing.append(env_name)
+
+    positions = []
+    for row in iter_invoice_export_lines(data):
+        positions.append(
+            {
+                "type": "KbPositionCustom",
+                "amount": f"{float(row['quantity']):.6f}",
+                "unit_id": required_ids["unit_id"],
+                "account_id": required_ids["account_id"],
+                "tax_id": required_ids["tax_id"],
+                "text": row["description"],
+                "unit_price": f"{_money(row['unit_price_ht']):.6f}",
+                "discount_in_percent": "0.000000",
+            }
+        )
+
+    payload = {
+        "title": f"Garage {data.license_plate}",
+        "contact_id": required_ids["contact_id"],
+        "user_id": required_ids["user_id"],
+        "bank_account_id": required_ids["bank_account_id"],
+        "language_id": required_ids["language_id"],
+        "currency_id": required_ids["currency_id"],
+        "payment_type_id": required_ids["payment_type_id"],
+        "header": f"Devis {data.devis_number} - {data.vehicle_label}",
+        "footer": "Devis genere depuis le panier fournisseur. Merci de verifier avant emission.",
+        "mwst_type": 0,
+        "mwst_is_net": True,
+        "show_position_taxes": True,
+        "is_valid_from": today.strftime("%Y-%m-%d"),
+        "is_valid_until": (today + timedelta(days=30)).strftime("%Y-%m-%d"),
+        "positions": positions,
+    }
+    return payload, missing
+
+
+def build_bexio_export(data: DevisData, request: DevisRequest, connector_token: Optional[str] = None) -> Dict[str, Any]:
+    payload, missing = build_bexio_draft_payload(data)
+    status_payload: Dict[str, Any] = {
+        "available": not missing,
+        "dry_run": True,
+        "message": "Dry-run bexio draft payload generated server-side.",
+        "missing_config": missing,
+    }
+
+    if request.export_target == "bexio_draft":
+        status_payload["payload"] = payload
+
+    if missing:
+        status_payload["message"] = "bexio draft export needs installation-specific IDs before live creation."
+        return status_payload
+
+    if request.bexio_dry_run or request.export_target != "bexio_draft":
+        return status_payload
+
+    expected_connector_token = os.getenv("ACCOUNTING_CONNECTOR_TOKEN", "").strip()
+    if not expected_connector_token or connector_token != expected_connector_token:
+        status_payload["available"] = False
+        status_payload["dry_run"] = True
+        status_payload["message"] = "Live bexio creation requires ACCOUNTING_CONNECTOR_TOKEN and X-Connector-Token; dry-run payload only."
+        return status_payload
+
+    access_token = os.getenv("BEXIO_ACCESS_TOKEN", "").strip()
+    if not access_token or access_token == "your_bexio_oauth_access_token_here":
+        status_payload["available"] = False
+        status_payload["message"] = "BEXIO_ACCESS_TOKEN is missing; live bexio draft creation skipped."
+        status_payload["missing_config"] = ["BEXIO_ACCESS_TOKEN"]
+        return status_payload
+
+    try:
+        response = requests.post(
+            "https://api.bexio.com/2.0/kb_invoice",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=20,
+        )
+        if response.status_code != 201:
+            status_payload["available"] = False
+            status_payload["message"] = f"bexio returned HTTP {response.status_code}; draft creation skipped in response."
+            status_payload["error"] = response.text[:500]
+            return status_payload
+        status_payload["dry_run"] = False
+        status_payload["message"] = "bexio draft invoice created."
+        status_payload["response"] = response.json()
+        return status_payload
+    except Exception as exc:
+        logger.warning("bexio draft creation failed: %s", exc)
+        status_payload["available"] = False
+        status_payload["message"] = "bexio draft creation failed; local exports remain available."
+        status_payload["error"] = str(exc)
+        return status_payload
+
+
+def build_winbiz_export(data: DevisData, request: DevisRequest) -> Dict[str, Any]:
+    required = {
+        "WINBIZ_ADDRESS_CODE": os.getenv("WINBIZ_ADDRESS_CODE"),
+        "WINBIZ_COLLECTIVE_ACCOUNT": os.getenv("WINBIZ_COLLECTIVE_ACCOUNT"),
+        "WINBIZ_SALES_ACCOUNT": os.getenv("WINBIZ_SALES_ACCOUNT"),
+    }
+    missing = [name for name, value in required.items() if not value]
+    status_payload: Dict[str, Any] = {
+        "available": False,
+        "format": "Winbiz DocumentImport semicolon CSV/WDX",
+        "missing_config": missing,
+        "message": "Winbiz import is documented, but customer/account codes are installation-specific.",
+    }
+    if missing or request.export_target != "winbiz_import":
+        return status_payload
+
+    rows = []
+    doc_type = os.getenv("WINBIZ_DOCUMENT_TYPE", "10")
+    vat_rate = _env_float("WINBIZ_VAT_RATE") or 8.1
+    for row in iter_invoice_export_lines(data):
+        fields = [""] * 155
+        fields[0] = "<NEW>"
+        fields[1] = doc_type
+        fields[2] = datetime.strptime(data.date, "%d.%m.%Y").strftime("%Y%m%d")
+        fields[4] = data.devis_number
+        fields[5] = f"{data.totals['total_ht']:.2f}"
+        fields[10] = required["WINBIZ_COLLECTIVE_ACCOUNT"] or ""
+        fields[19] = required["WINBIZ_ADDRESS_CODE"] or ""
+        fields[47] = str(row["position"])
+        fields[48] = "0"
+        fields[50] = str(row["description"])[:250]
+        fields[52] = f"{float(row['quantity']):.4f}"
+        fields[53] = f"{_money(row['unit_price_ht']):.4f}"
+        fields[54] = row["unit"]
+        fields[56] = f"{_money(row['total_ht']):.2f}"
+        fields[59] = required["WINBIZ_SALES_ACCOUNT"] or ""
+        fields[60] = f"{vat_rate:.2f}"
+        fields[61] = "2"
+        fields[63] = "2"
+        rows.append(";".join(str(value).replace(";", ",") for value in fields))
+
+    status_payload["available"] = True
+    status_payload["message"] = "Winbiz import file generated from configured Winbiz codes; test in Winbiz before production use."
+    status_payload["filename"] = f"{data.devis_number}_winbiz.wdx"
+    status_payload["content"] = "\r\n".join(rows) + "\r\n"
+    status_payload["missing_config"] = []
+    return status_payload
+
+
+def build_cresus_export(data: DevisData, request: DevisRequest) -> Dict[str, Any]:
+    return {
+        "available": False,
+        "message": "Crésus official docs found for assisted/list imports, but no clear invoice/devis line import API format was confirmed.",
+        "format": None,
+    }
+
+
+def build_export_status(
+    data: DevisData,
+    request: DevisRequest,
+    csv_text: str,
+    pdf_base64: str,
+    connector_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "text": {
+            "available": True,
+            "filename": f"{data.devis_number}.txt",
+        },
+        "csv": {
+            "available": True,
+            "filename": f"{data.devis_number}.csv",
+            "delimiter": ";",
+            "rows": len(iter_invoice_export_lines(data)),
+        },
+        "pdf": {
+            "available": bool(pdf_base64),
+            "filename": f"{data.devis_number}.pdf",
+        },
+        "bexio": build_bexio_export(data, request, connector_token),
+        "winbiz": build_winbiz_export(data, request),
+        "cresus": build_cresus_export(data, request),
+    }
+
+
+def _pdf_safe(value: Any) -> str:
+    text = str(value)
+    replacements = {
+        "œ": "oe",
+        "Œ": "Oe",
+        "’": "'",
+        "‘": "'",
+        "“": '"',
+        "”": '"',
+        "–": "-",
+        "—": "-",
+        "…": "...",
+        "\xa0": " ",
+    }
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+    return text
+
+
+def _fit_pdf_text(pdf: FPDF, text: str, width: float) -> str:
+    safe = _pdf_safe(text)
+    if pdf.get_string_width(safe) <= width - 2:
+        return safe
+    while safe and pdf.get_string_width(safe + "...") > width - 2:
+        safe = safe[:-1]
+    return safe.rstrip() + "..."
+
+
+def _pdf_section_title(pdf: FPDF, title: str):
+    if pdf.get_y() > 252:
+        pdf.add_page()
+    pdf.ln(4)
+    pdf.set_font("helvetica", "B", 11)
+    pdf.set_text_color(30, 64, 175)
+    pdf.cell(0, 7, _pdf_safe(title), ln=True)
+    pdf.set_text_color(15, 23, 42)
+
+
+def _pdf_table_header(pdf: FPDF, labels: List[str], widths: List[float]):
+    pdf.set_font("helvetica", "B", 8)
+    pdf.set_fill_color(241, 245, 249)
+    pdf.set_draw_color(203, 213, 225)
+    for label, width in zip(labels, widths):
+        pdf.cell(width, 7, _pdf_safe(label), border=1, fill=True)
+    pdf.ln()
+
+
+def _pdf_table_row(pdf: FPDF, values: List[str], widths: List[float], aligns: Optional[List[str]] = None):
+    if pdf.get_y() > 260:
+        pdf.add_page()
+    pdf.set_font("helvetica", "", 8)
+    pdf.set_draw_color(226, 232, 240)
+    aligns = aligns or ["L"] * len(values)
+    for value, width, align in zip(values, widths, aligns):
+        pdf.cell(width, 7, _fit_pdf_text(pdf, value, width), border=1, align=align)
+    pdf.ln()
+
+
+def create_structured_devis_pdf(data: DevisData) -> bytes:
+    pdf = FPDF(format="A4")
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.set_margins(12, 12, 12)
+    pdf.add_page()
+
+    pdf.set_fill_color(15, 23, 42)
+    pdf.rect(0, 0, 210, 10, "F")
+    pdf.set_y(16)
+    pdf.set_font("helvetica", "B", 16)
+    pdf.set_text_color(15, 23, 42)
+    pdf.cell(0, 8, "DEVIS DE REPARATION AUTOMOBILE", ln=True)
+
+    pdf.set_font("helvetica", "", 9)
+    pdf.set_text_color(71, 85, 105)
+    pdf.cell(0, 5, "Garage Automobile de Lausanne - Garage a completer, Canton de Vaud", ln=True)
+    pdf.cell(0, 5, "IDE/TVA: CHE-XXX.XXX.XXX TVA", ln=True)
+
+    pdf.ln(4)
+    pdf.set_fill_color(248, 250, 252)
+    pdf.set_draw_color(226, 232, 240)
+    pdf.rect(12, pdf.get_y(), 186, 32, "DF")
+    y = pdf.get_y() + 3
+    pdf.set_xy(15, y)
+    pdf.set_font("helvetica", "B", 9)
+    pdf.cell(30, 5, "No devis:")
+    pdf.set_font("helvetica", "", 9)
+    pdf.cell(65, 5, _pdf_safe(data.devis_number))
+    pdf.set_font("helvetica", "B", 9)
+    pdf.cell(25, 5, "Date:")
+    pdf.set_font("helvetica", "", 9)
+    pdf.cell(55, 5, _pdf_safe(data.date), ln=True)
+
+    pdf.set_x(15)
+    pdf.set_font("helvetica", "B", 9)
+    pdf.cell(30, 5, "Client:")
+    pdf.set_font("helvetica", "", 9)
+    pdf.cell(65, 5, _fit_pdf_text(pdf, data.client_name, 65))
+    pdf.set_font("helvetica", "B", 9)
+    pdf.cell(25, 5, "Plaque:")
+    pdf.set_font("helvetica", "", 9)
+    pdf.cell(55, 5, _pdf_safe(data.license_plate), ln=True)
+
+    pdf.set_x(15)
+    pdf.set_font("helvetica", "B", 9)
+    pdf.cell(30, 5, "Vehicule:")
+    pdf.set_font("helvetica", "", 9)
+    pdf.cell(65, 5, _fit_pdf_text(pdf, data.vehicle_label, 65))
+    pdf.set_font("helvetica", "B", 9)
+    pdf.cell(25, 5, "Operation:")
+    pdf.set_font("helvetica", "", 9)
+    pdf.cell(55, 5, _fit_pdf_text(pdf, data.operation_type, 55), ln=True)
+    pdf.ln(12)
+
+    _pdf_section_title(pdf, "1. Main-d'oeuvre")
+    labor_widths = [98, 24, 35, 28]
+    _pdf_table_header(pdf, ["Description", "Heures", "Taux HT", "Total HT"], labor_widths)
+    if data.labor:
+        for labor in data.labor:
+            _pdf_table_row(
+                pdf,
+                [labor.description, _format_qty(labor.hours), _format_chf(labor.hourly_rate), _format_chf(labor.total_ht)],
+                labor_widths,
+                ["L", "R", "R", "R"],
+            )
+    else:
+        _pdf_table_row(pdf, ["Aucune main-d'oeuvre ajoutee", "-", "-", "-"], labor_widths)
+
+    _pdf_section_title(pdf, "2. Pieces")
+    part_widths = [26, 64, 20, 20, 25, 25]
+    _pdf_table_header(pdf, ["Reference", "Designation", "Marque", "Qte", "Prix HT", "Total HT"], part_widths)
+    if data.parts:
+        for part in data.parts:
+            _pdf_table_row(
+                pdf,
+                [
+                    part.reference or "-",
+                    part.description,
+                    part.brand or "-",
+                    _format_qty(part.quantity),
+                    _format_chf(part.unit_price_ht),
+                    _format_chf(part.total_ht),
+                ],
+                part_widths,
+                ["L", "L", "L", "R", "R", "R"],
+            )
+    else:
+        _pdf_table_row(pdf, ["-", "Aucune piece detectee automatiquement", "-", "-", "-", "-"], part_widths)
+
+    _pdf_section_title(pdf, "3. Frais annexes et consommables")
+    fee_widths = [145, 40]
+    _pdf_table_header(pdf, ["Description", "Montant HT"], fee_widths)
+    if data.fees:
+        for fee in data.fees:
+            _pdf_table_row(pdf, [fee.description, _format_chf(fee.amount_ht)], fee_widths, ["L", "R"])
+    else:
+        _pdf_table_row(pdf, ["Aucun frais annexe ajoute", "-"], fee_widths)
+
+    _pdf_section_title(pdf, "Resume financier")
+    pdf.set_font("helvetica", "", 9)
+    summary_rows = [
+        ("Total main-d'oeuvre HT", data.totals["total_labor_ht"]),
+        ("Total pieces HT", data.totals["total_parts_ht"]),
+        ("Total frais HT", data.totals["total_fees_ht"]),
+        ("Total HT", data.totals["total_ht"]),
+        ("TVA 8.1%", data.totals["tva_amount"]),
+        ("Total TTC", data.totals["total_ttc"]),
+    ]
+    for label, amount in summary_rows:
+        pdf.set_x(112)
+        pdf.set_font("helvetica", "B" if label == "Total TTC" else "", 9)
+        pdf.cell(55, 6, _pdf_safe(label), border=1)
+        pdf.cell(31, 6, _format_chf(amount), border=1, align="R", ln=True)
+
+    pdf.ln(6)
+    pdf.set_font("helvetica", "I", 8)
+    pdf.set_text_color(71, 85, 105)
+    legal = (
+        "Devis valable 30 jours. Tout travail supplementaire depassant 10% du montant HT "
+        "necessite l'accord du client. Paiement du a la restitution du vehicule."
+    )
+    pdf.multi_cell(0, 4.5, _pdf_safe(legal))
+
+    output = pdf.output(dest="S")
+    if isinstance(output, str):
+        return output.encode("latin-1")
+    return bytes(output)
+
+@app.post("/api/generate-devis", response_model=DevisResponse, tags=["Devis"])
+async def api_generate_devis(request: DevisRequest, connector_token: Optional[str] = Header(default=None, alias="X-Connector-Token")):
     """
-    Endpoint called by the Chrome Extension to generate a professional Swiss repair estimate (devis)
-    from extracted webpage shopping cart text.
-    It automatically produces both:
-    1. A devis_[timestamp].txt text file saved in the corresponding Drive folder.
-    2. A beautifully formatted corporate devis_[timestamp].pdf A4 document saved in the same Drive folder.
+    Endpoint called by the Chrome Extension after the user clicks the popup on
+    the currently active supplier/cart tab. It extracts candidate parts, applies
+    deterministic garage pricing, and returns review data plus a PDF.
     """
     logger.info(f"Received devis generation request for plate: '{request.license_plate}', margin: {request.margin_percentage}%")
-    
-    if not request.webpage_text:
-        return {"error": "Le texte de la page web est vide."}
-        
+
+    data = build_devis_data(request)
+    devis_text = build_devis_text(data)
+    csv_text = build_invoice_csv(data)
+    pdf_base64 = ""
     try:
-        # 1. Generate text estimate using Gemini
-        devis_text = generate_devis_with_gemini(request.webpage_text, request.margin_percentage or 20.0)
-        if not devis_text:
-            return {"error": "Impossible de générer le devis avec l'IA."}
-            
-        # 2. Extract Swiss license plate
-        plate = extract_swiss_plate(request.license_plate)
-        if not plate:
-            # Fallback if no valid Swiss format was input
-            plate = request.license_plate.strip().upper() or "A_TRAITER_SANS_PLAQUE"
-            
-        # 3. Get authenticated Drive service
-        drive_service = get_drive_service()
-        
-        parent_folder_id = os.getenv("GOOGLE_DRIVE_PARENT_FOLDER_ID")
-        if not parent_folder_id:
-            logger.critical("GOOGLE_DRIVE_PARENT_FOLDER_ID is missing from config.")
-            return {"error": "Configuration du Google Drive manquante."}
-            
-        # 4. Resolve folder for the plate
-        folder_id = get_or_create_subfolder(drive_service, parent_folder_id, plate)
-        
-        # 5. Generate unique filename with timestamp
-        swiss_tz = pytz.timezone("Europe/Zurich")
-        now_swiss = datetime.now(swiss_tz)
-        timestamp = now_swiss.strftime("%Y%m%d_%H%M%S")
-        
-        txt_filename = f"devis_{timestamp}.txt"
-        pdf_filename = f"devis_{timestamp}.pdf"
-        
-        # 6. Upload original TEXT file to Google Drive folder
-        devis_bytes = devis_text.encode("utf-8")
-        upload_file_to_folder(
-            drive_service=drive_service,
-            folder_id=folder_id,
-            file_content=devis_bytes,
-            filename=txt_filename,
-            mimetype="text/plain"
-        )
-        
-        # 7. Generate professional PDF file in memory
-        logger.info("Generating Swiss corporate devis PDF document...")
-        pdf_bytes = create_devis_pdf(devis_text, plate)
-        
-        # 8. Upload the PDF file to the same Google Drive folder
-        upload_file_to_folder(
-            drive_service=drive_service,
-            folder_id=folder_id,
-            file_content=pdf_bytes,
-            filename=pdf_filename,
-            mimetype="application/pdf"
-        )
-        
-        logger.info(f"Professional text & PDF devis generated and saved in Google Drive under folder {plate}")
-        
-        # Base64 encode the PDF bytes for client-side download capabilities
+        pdf_bytes = create_structured_devis_pdf(data)
         pdf_base64 = base64.b64encode(pdf_bytes).decode("utf-8")
-        
-        return {
-            "success": True,
-            "plate": plate,
-            "filename_txt": txt_filename,
-            "filename_pdf": pdf_filename,
-            "devis": devis_text,
-            "pdf_base64": pdf_base64
-        }
-        
-    except Exception as e:
-        logger.exception("An error occurred during devis generation and storage:")
-        return {"error": f"Échec du traitement : {str(e)}"}
+    except Exception:
+        logger.exception("PDF generation failed for devis %s", data.devis_number)
+        data.warnings.append("Le devis texte a ete genere, mais le PDF n'a pas pu etre cree.")
+
+    exports = build_export_status(data, request, csv_text, pdf_base64, connector_token)
+    target_to_export = {
+        "bexio_draft": "bexio",
+        "winbiz_import": "winbiz",
+        "cresus_import": "cresus",
+    }
+    export_key = target_to_export.get(request.export_target)
+    if export_key and not exports[export_key].get("available"):
+        data.warnings.append(exports[export_key].get("message", "Export cible indisponible."))
+
+    return DevisResponse(
+        devis=devis_text,
+        csv=csv_text,
+        pdf_base64=pdf_base64,
+        plate=data.license_plate,
+        parts=data.parts,
+        labor=data.labor,
+        fees=data.fees,
+        totals=data.totals,
+        warnings=data.warnings,
+        exports=exports,
+    )
 
 # =====================================================================
 # --- Twilio Incoming WhatsApp Webhook Router ---
@@ -1186,7 +2238,7 @@ async def webhook_whatsapp(
         if Body:
             # 3a. Try Gemini Analysis first if API key is configured
             gemini_result = None
-            if os.getenv("GEMINI_API_KEY"):
+            if get_configured_gemini_api_key():
                 logger.info("GEMINI_API_KEY found. Analyzing message using Gemini intermediate intelligence layer...")
                 gemini_result = analyze_mechanic_message_with_gemini(Body)
                 
